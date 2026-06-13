@@ -8,6 +8,8 @@ else
     TARGET := iphone:clang:latest:13.0
 endif
 
+SUBPROJECTS += mcp-root
+
 include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = com.susu.mcp
@@ -41,6 +43,8 @@ after-stage::
 	$(ECHO_NOTHING)mkdir -p "$(THEOS_STAGING_DIR)/Library/PreferenceLoader/Preferences"$(ECHO_END)
 	$(ECHO_NOTHING)cp prefs/entry/ios-mcp.plist "$(THEOS_STAGING_DIR)/Library/PreferenceLoader/Preferences/com.susu.mcp.plist"$(ECHO_END)
 	@# Bundle mcp-root (setuid root helper for running commands as root from mobile)
+	$(ECHO_NOTHING)mkdir -p "$(THEOS_STAGING_DIR)/usr/bin"$(ECHO_END)
+	$(ECHO_NOTHING)$(MAKE) -C mcp-root $(if $(THEOS_PACKAGE_SCHEME),THEOS_PACKAGE_SCHEME=$(THEOS_PACKAGE_SCHEME))$(ECHO_END)
 	$(ECHO_NOTHING)cp mcp-root/.theos/obj/mcp-root "$(THEOS_STAGING_DIR)/usr/bin/mcp-root"$(ECHO_END)
 	$(ECHO_NOTHING)chmod 4755 "$(THEOS_STAGING_DIR)/usr/bin/mcp-root"$(ECHO_END)
 
