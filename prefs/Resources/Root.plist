@@ -12,7 +12,7 @@
 			<key>label</key>
 			<string>服务控制</string>
 			<key>footerText</key>
-			<string>当前状态：稍后检测...</string>
+			<string>当前状态：正在获取...</string>
 		</dict>
 		<dict>
 			<key>action</key>
@@ -24,7 +24,35 @@
 			<key>id</key>
 			<string>toggleServerButton</string>
 			<key>label</key>
-			<string>稍后检测...</string>
+			<string>正在获取...</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>id</key>
+			<string>mcpAddressGroup</string>
+			<key>label</key>
+			<string>点击对应地址自动复制</string>
+		</dict>
+		<dict>
+			<key>action</key>
+			<string>copyLANAddress:</string>
+			<key>cell</key>
+			<string>PSButtonCell</string>
+			<key>id</key>
+			<string>lanAddressButton</string>
+			<key>label</key>
+			<string>http://127.0.0.1:8090/mcp</string>
+		</dict>
+		<dict>
+			<key>action</key>
+			<string>copyLocalAddress:</string>
+			<key>cell</key>
+			<string>PSButtonCell</string>
+			<key>id</key>
+			<string>localAddressButton</string>
+			<key>label</key>
+			<string>http://localhost:8090/mcp</string>
 		</dict>
 		<dict>
 			<key>cell</key>
