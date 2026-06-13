@@ -303,8 +303,38 @@
     return current ?: self;
 }
 
+- (UIWindow *)mcpActiveWindow {
+    if (self.view.window) {
+        return self.view.window;
+    }
+
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) {
+            continue;
+        }
+
+        UIWindowScene *windowScene = (UIWindowScene *)scene;
+        if (windowScene.activationState != UISceneActivationStateForegroundActive &&
+            windowScene.activationState != UISceneActivationStateForegroundInactive) {
+            continue;
+        }
+
+        for (UIWindow *window in windowScene.windows) {
+            if (window.isKeyWindow) {
+                return window;
+            }
+        }
+
+        if (windowScene.windows.count > 0) {
+            return windowScene.windows.firstObject;
+        }
+    }
+
+    return nil;
+}
+
 - (UIViewController *)mcpAlertPresenter {
-    UIWindow *window = self.view.window ?: UIApplication.sharedApplication.keyWindow;
+    UIWindow *window = [self mcpActiveWindow];
     UIViewController *rootViewController = window.rootViewController ?: self.navigationController ?: self;
     return [self mcpTopViewControllerFromViewController:rootViewController];
 }
