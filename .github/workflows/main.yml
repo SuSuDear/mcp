@@ -1,66 +1,48 @@
-name: Build iOS MCP
+# Rootful: iOS 13.0+, Rootless: iOS 15.0+, Roothide: iOS 15.0+
+ARCHS = arm64 arm64e
+ifeq ($(THEOS_PACKAGE_SCHEME),rootless)
+    TARGET := iphone:clang:latest:15.0
+else ifeq ($(THEOS_PACKAGE_SCHEME),roothide)
+    TARGET := iphone:clang:latest:15.0
+else
+    TARGET := iphone:clang:latest:13.0
+endif
 
-on:
-  workflow_dispatch:
+include $(THEOS)/makefiles/common.mk
 
-jobs:
-  build:
-    runs-on: macos-14
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - scheme_var: ""
-            artifact_name: rootful
-          - scheme_var: "THEOS_PACKAGE_SCHEME=rootless"
-            artifact_name: rootless
-          - scheme_var: "THEOS_PACKAGE_SCHEME=roothide"
-            artifact_name: roothide
+TWEAK_NAME = com.susu.mcp
+BUNDLE_NAME = iosmcpprefs
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-          fetch-depth: 0
+com.susu.mcp_FILES = Tweak.x MCPServer.m MCPProcessUtil.m
+com.susu.mcp_CFLAGS = -fobjc-arc -Wno-unused-function -Wno-deprecated-declarations
+com.susu.mcp_FRAMEWORKS = IOKit UIKit CoreGraphics QuartzCore MobileCoreServices AVFoundation Security
 
-      - name: Install dependencies
-        run: |
-          brew install ldid make dpkg
-          echo "$(brew --prefix make)/libexec/gnubin" >> $GITHUB_PATH
+ifeq ($(THEOS_PACKAGE_SCHEME),roothide)
+    com.susu.mcp_LIBRARIES = roothide
+    com.susu.mcp_CFLAGS += -DMCP_ROOTHIDE=1
+    iosmcpprefs_LIBRARIES = roothide
+else ifeq ($(THEOS_PACKAGE_SCHEME),rootless)
+    com.susu.mcp_CFLAGS += -DMCP_ROOTLESS=1
+endif
 
-      - name: Install Theos
-        run: |
-          git clone --recursive https://github.com/roothide/theos.git "$GITHUB_WORKSPACE/theos"
-          echo "THEOS=$GITHUB_WORKSPACE/theos" >> "$GITHUB_ENV"
+iosmcpprefs_FILES = prefs/IOSMCPRootListController.m
+iosmcpprefs_CFLAGS = -fobjc-arc
+iosmcpprefs_FRAMEWORKS = UIKit CoreGraphics
+iosmcpprefs_PRIVATE_FRAMEWORKS = Preferences
+iosmcpprefs_LDFLAGS = -F$(THEOS)/sdks/iPhoneOS16.5.sdk/System/Library/PrivateFrameworks
+iosmcpprefs_INSTALL_PATH = /Library/PreferenceBundles
+iosmcpprefs_RESOURCE_DIRS = prefs/Resources
 
+include $(THEOS_MAKE_PATH)/tweak.mk
+include $(THEOS_MAKE_PATH)/bundle.mk
+include $(THEOS_MAKE_PATH)/aggregate.mk
 
-      - name: Install iPhoneOS16.5 SDK
-        run: |
-          git init /tmp/iOS-SDKs
-          cd /tmp/iOS-SDKs
-          git remote add origin https://github.com/xybp888/iOS-SDKs.git
-          git sparse-checkout init --cone
-          git sparse-checkout set iPhoneOS16.5.sdk
-          git fetch --depth=1 --filter=blob:none origin 1b92ff4a8928f582876e1d388d1381c6a0c59eb9
-          git checkout FETCH_HEAD
-          mkdir -p "$THEOS/sdks"
-          rm -rf "$THEOS/sdks/iPhoneOS16.5.sdk"
-          cp -R iPhoneOS16.5.sdk "$THEOS/sdks/"
+after-stage::
+	$(ECHO_NOTHING)mkdir -p "$(THEOS_STAGING_DIR)/Library/PreferenceLoader/Preferences"$(ECHO_END)
+	$(ECHO_NOTHING)cp prefs/entry/ios-mcp.plist "$(THEOS_STAGING_DIR)/Library/PreferenceLoader/Preferences/com.susu.mcp.plist"$(ECHO_END)
+	@# Bundle mcp-root (setuid root helper for running commands as root from mobile)
+	$(ECHO_NOTHING)cp mcp-root/.theos/obj/mcp-root "$(THEOS_STAGING_DIR)/usr/bin/mcp-root"$(ECHO_END)
+	$(ECHO_NOTHING)chmod 4755 "$(THEOS_STAGING_DIR)/usr/bin/mcp-root"$(ECHO_END)
 
-      - name: Build mcp-root
-        working-directory: mcp-root
-        run: make ${{ matrix.scheme_var }}
-
-      - name: Build ios-mcp package
-        run: |
-          make clean
-          make package ${{ matrix.scheme_var }}
-
-      - name: Upload deb artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ios-mcp-${{ matrix.artifact_name }}
-          path: |
-            packages/*.deb
-          if-no-files-found: error
+after-install::
+	install.exec "killall -9 SpringBoard"
