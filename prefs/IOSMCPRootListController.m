@@ -1,8 +1,6 @@
 #import "IOSMCPRootListController.h"
 #import <Preferences/PSSpecifier.h>
 #import <UIKit/UIKit.h>
-#import <spawn.h>
-#include <roothide.h>
 #import "../IOSMCPPreferences.h"
 
 @interface IOSMCPRootListController ()
@@ -12,6 +10,9 @@
 @property (nonatomic, assign) NSUInteger serverStatusCheckGeneration;
 @property (nonatomic, strong) NSURLSession *serverStatusSession;
 @property (nonatomic, strong) NSURLSessionDataTask *serverStatusTask;
+@property (nonatomic, strong) PSSpecifier *addressGroupSpecifier;
+@property (nonatomic, strong) PSSpecifier *lanAddressSpecifier;
+@property (nonatomic, strong) PSSpecifier *localAddressSpecifier;
 
 @end
 
@@ -20,6 +21,10 @@
 - (NSArray *)specifiers {
     if (!_specifiers) {
         _specifiers = [self loadSpecifiersFromPlistName:@"Root" target:self];
+        self.addressGroupSpecifier = [self specifierForID:@"mcpAddressGroup"];
+        self.lanAddressSpecifier = [self specifierForID:@"lanAddressButton"];
+        self.localAddressSpecifier = [self specifierForID:@"localAddressButton"];
+        [self updateAddressTitles];
     }
 
     return _specifiers;
@@ -27,10 +32,6 @@
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"重启"
-                                                                              style:UIBarButtonItemStylePlain
-                                                                             target:self
-                                                                             action:@selector(respringDevice:)];
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(applicationDidEnterBackground:)
                                                  name:UIApplicationDidEnterBackgroundNotification
@@ -54,19 +55,15 @@
 - (void)copyLANAddress:(PSSpecifier *)specifier {
     NSString *url = IOSMCPServiceURLString();
     [UIPasteboard generalPasteboard].string = url;
-    [self showAlertWithTitle:@"已复制局域网地址" message:url];
 }
 
 - (void)copyLocalAddress:(PSSpecifier *)specifier {
     NSString *url = [self localMCPURLString];
     [UIPasteboard generalPasteboard].string = url;
-    [self showAlertWithTitle:@"已复制本机地址" message:url];
 }
 
 - (void)copyPrompt:(PSSpecifier *)specifier {
     [UIPasteboard generalPasteboard].string = [self codexPrompt];
-    [self showAlertWithTitle:@"已复制"
-                     message:@"MCP 提示词片段已复制到剪贴板，粘贴到你的提示词中即可。"];
 }
 
 - (void)viewWillDisappear:(BOOL)animated {
@@ -96,37 +93,17 @@
     [self updateControlStatusText:shouldStart ? @"当前状态：正在启动..." : @"当前状态：正在关闭..."
                       buttonTitle:shouldStart ? @"正在启动..." : @"正在关闭..."
                     buttonEnabled:NO];
-
-    [self showAlertWithTitle:shouldStart ? @"iOS MCP 已启动" : @"iOS MCP 已关闭"
-                     message:shouldStart ? @"服务已经启动，并会在下次 SpringBoard 启动后自动开启。"
-                                        : @"服务已经停止，并会保持关闭状态，直到你再次手动启动。"];
+    [self updateAddressSpecifiersVisible:shouldStart];
 
     [self scheduleServerStatusRefreshAfterDelay:0.8];
-}
-
-- (void)respringDevice:(PSSpecifier *)specifier {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"重启 SpringBoard"
-                                                                  message:@"确定要重启 SpringBoard 吗？重启后需要重新解锁设备。"
-                                                           preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"重启" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(300 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
-            pid_t pid;
-            const char *argv[] = {"killall", "SpringBoard", NULL};
-            NSString *killallPath = jbroot(@"/usr/bin/killall");
-            const char *spawnPath = killallPath.length ? killallPath.fileSystemRepresentation : "/usr/bin/killall";
-            posix_spawn(&pid, spawnPath, NULL, NULL, (char *const *)argv, NULL);
-        });
-    }]];
-    [self presentViewController:alert animated:YES completion:nil];
 }
 
 - (void)scheduleServerStatusRefreshAfterDelay:(NSTimeInterval)delay {
     [self cancelServerStatusRefresh];
     NSUInteger generation = ++self.serverStatusCheckGeneration;
 
-    [self updateControlStatusText:@"当前状态：稍后检测..."
-                      buttonTitle:@"稍后检测..."
+    [self updateControlStatusText:@"当前状态：正在获取..."
+                      buttonTitle:@"正在获取..."
                     buttonEnabled:NO];
 
     __weak typeof(self) weakSelf = self;
@@ -198,6 +175,7 @@
             [self updateControlStatusText:running ? @"当前状态：运行中" : @"当前状态：未运行"
                               buttonTitle:running ? @"关闭 iOS MCP" : @"启动 iOS MCP"
                             buttonEnabled:YES];
+            [self updateAddressSpecifiersVisible:running];
             [session finishTasksAndInvalidate];
         });
     }];
@@ -246,6 +224,55 @@
     }
 }
 
+- (void)updateAddressTitles {
+    NSString *lanURL = IOSMCPServiceURLString();
+    NSString *localURL = [self localMCPURLString];
+
+    if (self.lanAddressSpecifier) {
+        self.lanAddressSpecifier.name = lanURL;
+        [self.lanAddressSpecifier setProperty:lanURL forKey:PSTitleKey];
+    }
+
+    if (self.localAddressSpecifier) {
+        self.localAddressSpecifier.name = localURL;
+        [self.localAddressSpecifier setProperty:localURL forKey:PSTitleKey];
+    }
+}
+
+- (BOOL)hasSpecifier:(PSSpecifier *)specifier {
+    return specifier && [[self specifiers] containsObject:specifier];
+}
+
+- (void)updateAddressSpecifiersVisible:(BOOL)visible {
+    if (!self.addressGroupSpecifier || !self.lanAddressSpecifier || !self.localAddressSpecifier) {
+        return;
+    }
+
+    if (visible) {
+        [self updateAddressTitles];
+        if (![self hasSpecifier:self.addressGroupSpecifier]) {
+            [self insertSpecifier:self.addressGroupSpecifier afterSpecifierID:@"toggleServerButton" animated:NO];
+        }
+        if (![self hasSpecifier:self.lanAddressSpecifier]) {
+            [self insertSpecifier:self.lanAddressSpecifier afterSpecifier:self.addressGroupSpecifier animated:NO];
+        }
+        if (![self hasSpecifier:self.localAddressSpecifier]) {
+            [self insertSpecifier:self.localAddressSpecifier afterSpecifier:self.lanAddressSpecifier animated:NO];
+        }
+        return;
+    }
+
+    if ([self hasSpecifier:self.localAddressSpecifier]) {
+        [self removeSpecifier:self.localAddressSpecifier animated:NO];
+    }
+    if ([self hasSpecifier:self.lanAddressSpecifier]) {
+        [self removeSpecifier:self.lanAddressSpecifier animated:NO];
+    }
+    if ([self hasSpecifier:self.addressGroupSpecifier]) {
+        [self removeSpecifier:self.addressGroupSpecifier animated:NO];
+    }
+}
+
 - (void)updateEnabledPreference:(BOOL)enabled {
     CFPreferencesSetAppValue((__bridge CFStringRef)IOS_MCP_ENABLED_PREFERENCE_KEY,
                              enabled ? kCFBooleanTrue : kCFBooleanFalse,
@@ -286,78 +313,5 @@
     [self cancelServerStatusRefresh];
 }
 
-- (UIViewController *)mcpTopViewControllerFromViewController:(UIViewController *)viewController {
-    UIViewController *current = viewController;
-    while (current.presentedViewController) {
-        current = current.presentedViewController;
-    }
-
-    if ([current isKindOfClass:[UINavigationController class]]) {
-        return [self mcpTopViewControllerFromViewController:((UINavigationController *)current).visibleViewController];
-    }
-
-    if ([current isKindOfClass:[UITabBarController class]]) {
-        return [self mcpTopViewControllerFromViewController:((UITabBarController *)current).selectedViewController];
-    }
-
-    return current ?: self;
-}
-
-- (UIWindow *)mcpActiveWindow {
-    if (self.view.window) {
-        return self.view.window;
-    }
-
-    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
-        if (![scene isKindOfClass:[UIWindowScene class]]) {
-            continue;
-        }
-
-        UIWindowScene *windowScene = (UIWindowScene *)scene;
-        if (windowScene.activationState != UISceneActivationStateForegroundActive &&
-            windowScene.activationState != UISceneActivationStateForegroundInactive) {
-            continue;
-        }
-
-        for (UIWindow *window in windowScene.windows) {
-            if (window.isKeyWindow) {
-                return window;
-            }
-        }
-
-        if (windowScene.windows.count > 0) {
-            return windowScene.windows.firstObject;
-        }
-    }
-
-    return nil;
-}
-
-- (UIViewController *)mcpAlertPresenter {
-    UIWindow *window = [self mcpActiveWindow];
-    UIViewController *rootViewController = window.rootViewController ?: self.navigationController ?: self;
-    return [self mcpTopViewControllerFromViewController:rootViewController];
-}
-
-- (void)showAlertWithTitle:(NSString *)title message:(NSString *)message {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIAlertController *alertController = [UIAlertController alertControllerWithTitle:title
-                                                                                 message:message
-                                                                          preferredStyle:UIAlertControllerStyleAlert];
-        [alertController addAction:[UIAlertAction actionWithTitle:@"确定"
-                                                            style:UIAlertActionStyleDefault
-                                                          handler:nil]];
-
-        UIViewController *presenter = [self mcpAlertPresenter];
-        if (presenter.presentedViewController) {
-            [presenter.presentedViewController dismissViewControllerAnimated:NO completion:^{
-                [[self mcpAlertPresenter] presentViewController:alertController animated:YES completion:nil];
-            }];
-            return;
-        }
-
-        [presenter presentViewController:alertController animated:YES completion:nil];
-    });
-}
 
 @end
