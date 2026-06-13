@@ -1,5 +1,4 @@
 #import "MCPServer.h"
-#import "ScreenManager.h"
 #import "MCPProcessUtil.h"
 #import <UIKit/UIKit.h>
 #import <sys/socket.h>
@@ -278,22 +277,6 @@ static NSDictionary *MCPJailbreakInfo(BOOL debug) {
     return [info copy];
 }
 
-static NSArray<NSString *> *MCPLockGuardAllowedTools(void) {
-    static NSArray<NSString *> *tools = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        tools = @[
-            @"get_device_info"
-        ];
-    });
-    return tools;
-}
-
-static BOOL MCPLockGuardToolAllowed(NSString *toolName) {
-    if (toolName.length == 0) return NO;
-    return [MCPLockGuardAllowedTools() containsObject:toolName];
-}
-
 static BOOL MCPStateBool(NSDictionary *state, NSString *key, BOOL *outValue) {
     id value = [state isKindOfClass:[NSDictionary class]] ? state[key] : nil;
     if (!value || value == [NSNull null] || ![value respondsToSelector:@selector(boolValue)]) {
@@ -301,25 +284,6 @@ static BOOL MCPStateBool(NSDictionary *state, NSString *key, BOOL *outValue) {
     }
     if (outValue) *outValue = [value boolValue];
     return YES;
-}
-
-static BOOL MCPDeviceStateRequiresWakeOrUnlock(NSDictionary *state) {
-    BOOL locked = NO;
-    if (MCPStateBool(state, @"locked", &locked) && locked) {
-        return YES;
-    }
-
-    BOOL lockScreenVisible = NO;
-    if (MCPStateBool(state, @"lock_screen_visible", &lockScreenVisible) && lockScreenVisible) {
-        return YES;
-    }
-
-    BOOL screenOn = YES;
-    if (MCPStateBool(state, @"screen_on", &screenOn) && !screenOn) {
-        return YES;
-    }
-
-    return NO;
 }
 
 static double MCPRandomUnit(void) {
@@ -394,7 +358,6 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
 - (NSDictionary *)handleInitialize:(id)reqId;
 - (NSDictionary *)handleToolsList:(id)reqId;
 - (NSDictionary *)handleToolsCall:(id)reqId params:(NSDictionary *)params;
-- (NSDictionary *)lockedScreenGuardResponseForTool:(NSString *)toolName reqId:(id)reqId;
 - (NSDictionary *)executeGetDeviceInfo:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeRunCommand:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)mcpSuccess:(id)reqId text:(NSString *)text;
@@ -881,40 +844,12 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
         return [self mcpError:reqId code:-32602 message:@"Missing tool name"];
     }
 
-    NSDictionary *lockGuardResponse = [self lockedScreenGuardResponseForTool:toolName reqId:reqId];
-    if (lockGuardResponse) {
-        return lockGuardResponse;
-    }
-
     if ([toolName isEqualToString:@"get_device_info"]) {
         return [self executeGetDeviceInfo:reqId args:args];
     } else if ([toolName isEqualToString:@"run_command"]) {
         return [self executeRunCommand:reqId args:args];
     }
     return [self mcpError:reqId code:-32602 message:[NSString stringWithFormat:@"Unknown tool: %@", toolName]];
-}
-
-- (NSDictionary *)lockedScreenGuardResponseForTool:(NSString *)toolName reqId:(id)reqId {
-    if (MCPLockGuardToolAllowed(toolName)) {
-        return nil;
-    }
-
-    NSDictionary *state = [[ScreenManager sharedInstance] deviceInteractionState];
-    if (!MCPDeviceStateRequiresWakeOrUnlock(state)) {
-        return nil;
-    }
-
-    NSDictionary *payload = @{
-        @"blocked": @YES,
-        @"tool": toolName ?: @"",
-        @"reason": @"device_locked_or_screen_off",
-        @"device_state": state ?: @{},
-        @"allowed_tools": MCPLockGuardAllowedTools(),
-        @"next_step": @"Unlock or wake the device manually before retrying the blocked tool."
-    };
-    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
-    NSString *jsonStr = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
-    return [self mcpSuccess:reqId text:jsonStr ?: @"Tool blocked while device is locked or screen is off" isError:YES];
 }
 
 #pragma mark - Tool Execution Helpers
