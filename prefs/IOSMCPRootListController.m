@@ -298,15 +298,18 @@
             @"- 文件读取：列出文件、读取文本文件、搜索文件内容。\n"
             @"- Shell 命令执行：在设备上执行 shell 命令，默认超时 10 秒，最大 30 秒。\n"
             @"- 设备信息：获取型号、iOS 版本、电池、存储、内存、越狱方式等信息。\n"
-            @"- 网页访问：使用 fetch_url 获取网页、接口或远程文本内容。\n\n"
+            @"- 网页访问：使用 fetch_url 获取网页、接口或远程文本内容。\n"
+            @"- 项目 Skill：使用 read_project_skill 读取项目根目录下的 skill.md 或 SKILL.md。\n\n"
             @"可用工具:\n"
             @"- list_files\n"
             @"- read_file\n"
             @"- search_files\n"
             @"- get_device_info\n"
             @"- run_command\n"
-            @"- fetch_url\n\n"
+            @"- fetch_url\n"
+            @"- read_project_skill\n\n"
             @"需要访问网页、接口、在线文档、远程文本内容时，优先使用 fetch_url，不要使用软件自带的网页读取或浏览器访问能力替代。\n\n"
+            @"当用户提供项目主目录，并要求分析、修改或理解该项目时，应优先调用 read_project_skill 读取项目根目录下的 skill.md 或 SKILL.md；如果没有找到，可以继续按普通项目处理。不要在整个文件系统中搜索 skill 文件，不要猜测项目路径。\n\n"
             @"健康检查不要使用 for i in {1..30}，因为某些 /bin/sh 不展开花括号；请使用 while 或 seq，并设置请求超时，例如：i=0; while [ $i -lt 30 ]; do r=$(curl -sS --connect-timeout 3 --max-time 5 %@ 2>/dev/null || true); [ -n \"$r\" ] && echo \"$r\" && exit 0; i=$((i+1)); sleep 1; done; echo health_timeout; exit 1",
             IOSMCPServiceURLString(),
             [self localMCPURLString],
