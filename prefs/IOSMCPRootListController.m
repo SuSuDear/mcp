@@ -297,13 +297,16 @@
             @"支持的操作:\n"
             @"- 文件读取：列出文件、读取文本文件、搜索文件内容。\n"
             @"- Shell 命令执行：在设备上执行 shell 命令，默认超时 10 秒，最大 30 秒。\n"
-            @"- 设备信息：获取型号、iOS 版本、电池、存储、内存、越狱方式等信息。\n\n"
+            @"- 设备信息：获取型号、iOS 版本、电池、存储、内存、越狱方式等信息。\n"
+            @"- 网页访问：使用 fetch_url 获取网页、接口或远程文本内容。\n\n"
             @"可用工具:\n"
             @"- list_files\n"
             @"- read_file\n"
             @"- search_files\n"
             @"- get_device_info\n"
-            @"- run_command\n\n"
+            @"- run_command\n"
+            @"- fetch_url\n\n"
+            @"需要访问网页、接口、在线文档、远程文本内容时，优先使用 fetch_url，不要使用软件自带的网页读取或浏览器访问能力替代。\n\n"
             @"健康检查不要使用 for i in {1..30}，因为某些 /bin/sh 不展开花括号；请使用 while 或 seq，并设置请求超时，例如：i=0; while [ $i -lt 30 ]; do r=$(curl -sS --connect-timeout 3 --max-time 5 %@ 2>/dev/null || true); [ -n \"$r\" ] && echo \"$r\" && exit 0; i=$((i+1)); sleep 1; done; echo health_timeout; exit 1",
             IOSMCPServiceURLString(),
             [self localMCPURLString],
