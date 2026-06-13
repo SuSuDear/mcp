@@ -47,6 +47,22 @@
     [self scheduleServerStatusRefreshAfterDelay:0.8];
 }
 
+- (NSString *)localMCPURLString {
+    return [NSString stringWithFormat:@"http://localhost:%d/mcp", IOS_MCP_DEFAULT_PORT];
+}
+
+- (void)copyLANAddress:(PSSpecifier *)specifier {
+    NSString *url = IOSMCPServiceURLString();
+    [UIPasteboard generalPasteboard].string = url;
+    [self showAlertWithTitle:@"已复制局域网地址" message:url];
+}
+
+- (void)copyLocalAddress:(PSSpecifier *)specifier {
+    NSString *url = [self localMCPURLString];
+    [UIPasteboard generalPasteboard].string = url;
+    [self showAlertWithTitle:@"已复制本机地址" message:url];
+}
+
 - (void)copyPrompt:(PSSpecifier *)specifier {
     [UIPasteboard generalPasteboard].string = [self codexPrompt];
     [self showAlertWithTitle:@"已复制"
@@ -248,7 +264,8 @@
 - (NSString *)codexPrompt {
     return [NSString stringWithFormat:
             @"你可以通过 com.susu.mcp 服务操作一台 iPhone 设备。\n\n"
-            @"MCP 地址: %@\n\n"
+            @"局域网 MCP 地址: %@\n"
+            @"本机 MCP 地址: %@\n\n"
             @"支持的操作:\n"
             @"- 文件读取：列出文件、读取文本文件、搜索文件内容。\n"
             @"- Shell 命令执行：在设备上执行 shell 命令，默认超时 10 秒，最大 30 秒。\n"
@@ -261,6 +278,7 @@
             @"- run_command\n\n"
             @"健康检查不要使用 for i in {1..30}，因为某些 /bin/sh 不展开花括号；请使用 while 或 seq，并设置请求超时，例如：i=0; while [ $i -lt 30 ]; do r=$(curl -sS --connect-timeout 3 --max-time 5 %@ 2>/dev/null || true); [ -n \"$r\" ] && echo \"$r\" && exit 0; i=$((i+1)); sleep 1; done; echo health_timeout; exit 1",
             IOSMCPServiceURLString(),
+            [self localMCPURLString],
             IOSMCPHealthURLString()];
 }
 - (void)dealloc {
@@ -268,14 +286,48 @@
     [self cancelServerStatusRefresh];
 }
 
+- (UIViewController *)mcpTopViewControllerFromViewController:(UIViewController *)viewController {
+    UIViewController *current = viewController;
+    while (current.presentedViewController) {
+        current = current.presentedViewController;
+    }
+
+    if ([current isKindOfClass:[UINavigationController class]]) {
+        return [self mcpTopViewControllerFromViewController:((UINavigationController *)current).visibleViewController];
+    }
+
+    if ([current isKindOfClass:[UITabBarController class]]) {
+        return [self mcpTopViewControllerFromViewController:((UITabBarController *)current).selectedViewController];
+    }
+
+    return current ?: self;
+}
+
+- (UIViewController *)mcpAlertPresenter {
+    UIWindow *window = self.view.window ?: UIApplication.sharedApplication.keyWindow;
+    UIViewController *rootViewController = window.rootViewController ?: self.navigationController ?: self;
+    return [self mcpTopViewControllerFromViewController:rootViewController];
+}
+
 - (void)showAlertWithTitle:(NSString *)title message:(NSString *)message {
-    UIAlertController *alertController = [UIAlertController alertControllerWithTitle:title
-                                                                             message:message
-                                                                      preferredStyle:UIAlertControllerStyleAlert];
-    [alertController addAction:[UIAlertAction actionWithTitle:@"确定"
-                                                        style:UIAlertActionStyleDefault
-                                                      handler:nil]];
-    [self presentViewController:alertController animated:YES completion:nil];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIAlertController *alertController = [UIAlertController alertControllerWithTitle:title
+                                                                                 message:message
+                                                                          preferredStyle:UIAlertControllerStyleAlert];
+        [alertController addAction:[UIAlertAction actionWithTitle:@"确定"
+                                                            style:UIAlertActionStyleDefault
+                                                          handler:nil]];
+
+        UIViewController *presenter = [self mcpAlertPresenter];
+        if (presenter.presentedViewController) {
+            [presenter.presentedViewController dismissViewControllerAnimated:NO completion:^{
+                [[self mcpAlertPresenter] presentViewController:alertController animated:YES completion:nil];
+            }];
+            return;
+        }
+
+        [presenter presentViewController:alertController animated:YES completion:nil];
+    });
 }
 
 @end
