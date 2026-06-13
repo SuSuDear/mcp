@@ -250,9 +250,13 @@
             @"你可以通过 com.susu.mcp 服务操作一台 iPhone 设备。\n\n"
             @"MCP 地址: %@\n\n"
             @"支持的操作:\n"
+            @"- 文件读取：列出文件、读取文本文件、搜索文件内容。\n"
             @"- Shell 命令执行：在设备上执行 shell 命令，默认超时 10 秒，最大 30 秒。\n"
             @"- 设备信息：获取型号、iOS 版本、电池、存储、内存、越狱方式等信息。\n\n"
             @"可用工具:\n"
+            @"- list_files\n"
+            @"- read_file\n"
+            @"- search_files\n"
             @"- get_device_info\n"
             @"- run_command\n\n"
             @"健康检查不要使用 for i in {1..30}，因为某些 /bin/sh 不展开花括号；请使用 while 或 seq，并设置请求超时，例如：i=0; while [ $i -lt 30 ]; do r=$(curl -sS --connect-timeout 3 --max-time 5 %@ 2>/dev/null || true); [ -n \"$r\" ] && echo \"$r\" && exit 0; i=$((i+1)); sleep 1; done; echo health_timeout; exit 1",
