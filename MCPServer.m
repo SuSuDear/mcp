@@ -961,7 +961,8 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
         }];
     };
 
-    void (^walk)(NSString *, NSInteger) = ^(NSString *dir, NSInteger depth) {
+    __block void (^walk)(NSString *, NSInteger);
+    walk = ^(NSString *dir, NSInteger depth) {
         NSArray *children = [[fm contentsOfDirectoryAtPath:dir error:nil] sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
         for (NSString *name in children) {
             if (!includeHidden && [name hasPrefix:@"."]) continue;
