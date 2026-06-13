@@ -1,0 +1,1186 @@
+#import "MCPServer.h"
+#import "ScreenManager.h"
+#import "MCPProcessUtil.h"
+#import <UIKit/UIKit.h>
+#import <sys/socket.h>
+#import <netinet/in.h>
+#import <arpa/inet.h>
+#import <unistd.h>
+#import <fcntl.h>
+#import <errno.h>
+#import <stdlib.h>
+#import <sys/utsname.h>
+#import <sys/statvfs.h>
+#import <sys/wait.h>
+#import <mach/mach.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
+#import <dlfcn.h>
+
+#define MCP_PROTOCOL_VERSION @"2025-03-26"
+#define MCP_SERVER_NAME      @"com.susu.mcp"
+#define MCP_SERVER_VERSION   @"1.1.1"
+#define HTTP_BUF_SIZE        (256 * 1024)
+#define MCP_MAX_CHUNK_LINE   (8 * 1024)
+#define MCP_LOG(fmt, ...)    NSLog(@"[susu][mcp] " fmt, ##__VA_ARGS__)
+
+static BOOL MCPNumberFromArgs(NSDictionary *args, NSString *key, double defaultValue, BOOL required, double *outValue, NSString **outError) {
+    id value = args[key];
+    if (!value || value == [NSNull null]) {
+        if (required) {
+            if (outError) *outError = [NSString stringWithFormat:@"Missing required parameter: %@", key];
+            return NO;
+        }
+        if (outValue) *outValue = defaultValue;
+        return YES;
+    }
+
+    if ([value isKindOfClass:[NSNumber class]]) {
+        if (outValue) *outValue = [value doubleValue];
+        return YES;
+    }
+
+    if ([value isKindOfClass:[NSString class]]) {
+        NSScanner *scanner = [NSScanner scannerWithString:(NSString *)value];
+        double parsed = 0;
+        if ([scanner scanDouble:&parsed] && scanner.isAtEnd) {
+            if (outValue) *outValue = parsed;
+            return YES;
+        }
+    }
+
+    if (outError) *outError = [NSString stringWithFormat:@"Invalid parameter %@: expected number", key];
+    return NO;
+}
+
+static BOOL MCPStringFromArgs(NSDictionary *args, NSString *key, BOOL required, NSString **outValue, NSString **outError) {
+    id value = args[key];
+    if (!value || value == [NSNull null]) {
+        if (required) {
+            if (outError) *outError = [NSString stringWithFormat:@"Missing required parameter: %@", key];
+            return NO;
+        }
+        if (outValue) *outValue = nil;
+        return YES;
+    }
+
+    if ([value isKindOfClass:[NSString class]]) {
+        if (outValue) *outValue = value;
+        return YES;
+    }
+
+    if (outError) *outError = [NSString stringWithFormat:@"Invalid parameter %@: expected string", key];
+    return NO;
+}
+
+static BOOL MCPBoolFromArgs(NSDictionary *args, NSString *key, BOOL defaultValue, BOOL *outValue, NSString **outError) {
+    id value = args[key];
+    if (!value || value == [NSNull null]) {
+        if (outValue) *outValue = defaultValue;
+        return YES;
+    }
+
+    if ([value isKindOfClass:[NSNumber class]]) {
+        if (outValue) *outValue = [value boolValue];
+        return YES;
+    }
+
+    if ([value isKindOfClass:[NSString class]]) {
+        NSString *lower = [(NSString *)value lowercaseString];
+        if ([lower isEqualToString:@"true"] || [lower isEqualToString:@"yes"] || [lower isEqualToString:@"1"]) {
+            if (outValue) *outValue = YES;
+            return YES;
+        }
+        if ([lower isEqualToString:@"false"] || [lower isEqualToString:@"no"] || [lower isEqualToString:@"0"]) {
+            if (outValue) *outValue = NO;
+            return YES;
+        }
+    }
+
+    if (outError) *outError = [NSString stringWithFormat:@"Invalid parameter %@: expected boolean", key];
+    return NO;
+}
+
+static NSString *MCPBasePath(NSString *path) {
+    if (!path.length) return @"";
+    NSRange query = [path rangeOfString:@"?"];
+    if (query.location == NSNotFound) return path;
+    return [path substringToIndex:query.location];
+}
+
+static BOOL MCPWriteAllToFD(int fd, const void *bytes, size_t length) {
+    const uint8_t *cursor = bytes;
+    size_t remaining = length;
+    while (remaining > 0) {
+        ssize_t written = write(fd, cursor, remaining);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) return NO;
+        cursor += written;
+        remaining -= (size_t)written;
+    }
+    return YES;
+}
+
+static NSRange MCPFindCRLF(NSData *data, NSUInteger offset) {
+    const uint8_t *bytes = data.bytes;
+    NSUInteger length = data.length;
+    if (!bytes || offset >= length) {
+        return NSMakeRange(NSNotFound, 0);
+    }
+
+    for (NSUInteger i = offset; i + 1 < length; i++) {
+        if (bytes[i] == '\r' && bytes[i + 1] == '\n') {
+            return NSMakeRange(i, 2);
+        }
+    }
+    return NSMakeRange(NSNotFound, 0);
+}
+
+static BOOL MCPParseHTTPChunkSize(NSData *lineData, unsigned long long *outSize) {
+    NSString *line = [[NSString alloc] initWithData:lineData encoding:NSASCIIStringEncoding];
+    if (line.length == 0) {
+        return NO;
+    }
+
+    NSString *sizePart = [line componentsSeparatedByString:@";"].firstObject;
+    sizePart = [sizePart stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (sizePart.length == 0) {
+        return NO;
+    }
+
+    const char *sizeCString = sizePart.UTF8String;
+    if (!sizeCString || sizeCString[0] == '\0') {
+        return NO;
+    }
+
+    errno = 0;
+    char *end = NULL;
+    unsigned long long size = strtoull(sizeCString, &end, 16);
+    if (errno != 0 || end == sizeCString || (end && *end != '\0')) {
+        return NO;
+    }
+
+    if (outSize) {
+        *outSize = size;
+    }
+    return YES;
+}
+
+static void MCPSetHTTPBodyError(int *errorStatus, NSString **errorMessage, int status, NSString *message) {
+    if (errorStatus) {
+        *errorStatus = status;
+    }
+    if (errorMessage) {
+        *errorMessage = message;
+    }
+}
+
+static void MCPAddWhitelistedKeys(NSMutableDictionary *destination, NSDictionary *source, NSArray<NSString *> *keys) {
+    if (![destination isKindOfClass:[NSMutableDictionary class]] ||
+        ![source isKindOfClass:[NSDictionary class]] ||
+        ![keys isKindOfClass:[NSArray class]]) {
+        return;
+    }
+
+    for (NSString *key in keys) {
+        id value = source[key];
+        if (value && value != [NSNull null]) {
+            destination[key] = value;
+        }
+    }
+}
+
+static BOOL MCPRectValuesFromDictionary(NSDictionary *rect, double *outX, double *outY, double *outWidth, double *outHeight) {
+    if (![rect isKindOfClass:[NSDictionary class]]) {
+        return NO;
+    }
+
+    id xValue = rect[@"x"] ?: rect[@"X"];
+    id yValue = rect[@"y"] ?: rect[@"Y"];
+    id widthValue = rect[@"width"] ?: rect[@"Width"];
+    id heightValue = rect[@"height"] ?: rect[@"Height"];
+    if (![xValue respondsToSelector:@selector(doubleValue)] ||
+        ![yValue respondsToSelector:@selector(doubleValue)] ||
+        ![widthValue respondsToSelector:@selector(doubleValue)] ||
+        ![heightValue respondsToSelector:@selector(doubleValue)]) {
+        return NO;
+    }
+
+    double x = [xValue doubleValue];
+    double y = [yValue doubleValue];
+    double width = [widthValue doubleValue];
+    double height = [heightValue doubleValue];
+    if (!isfinite(x) || !isfinite(y) || !isfinite(width) || !isfinite(height) || width <= 0.0 || height <= 0.0) {
+        return NO;
+    }
+
+    if (outX) *outX = x;
+    if (outY) *outY = y;
+    if (outWidth) *outWidth = width;
+    if (outHeight) *outHeight = height;
+    return YES;
+}
+
+static BOOL MCPDirectoryExists(NSString *path) {
+    if (path.length == 0) return NO;
+    BOOL isDirectory = NO;
+    return [[NSFileManager defaultManager] fileExistsAtPath:path isDirectory:&isDirectory] && isDirectory;
+}
+
+static NSDictionary *MCPHelperExecutableStatus(NSString *logicalPath) {
+    NSString *resolvedPath = MCPResolvedJailbreakPath(logicalPath);
+    BOOL executable = resolvedPath.length > 0 && [[NSFileManager defaultManager] isExecutableFileAtPath:resolvedPath];
+    return @{
+        @"path": resolvedPath ?: @"",
+        @"executable": @(executable)
+    };
+}
+
+static NSDictionary *MCPJailbreakInfo(BOOL debug) {
+    NSString *packageScheme = nil;
+    NSString *packageArchitecture = nil;
+#ifdef MCP_ROOTHIDE
+    packageScheme = @"roothide";
+    packageArchitecture = @"iphoneos-arm64e";
+#elif defined(MCP_ROOTLESS)
+    packageScheme = @"rootless";
+    packageArchitecture = @"iphoneos-arm64";
+#else
+    packageScheme = @"rootful";
+    packageArchitecture = @"iphoneos-arm";
+#endif
+
+    NSString *type = packageScheme;
+    NSString *rootPath = @"/";
+    if ([packageScheme isEqualToString:@"roothide"]) {
+        NSString *candidate = MCPResolvedJailbreakPath(@"/");
+        rootPath = candidate.length > 0 ? candidate : @"/var/jb";
+    } else if ([packageScheme isEqualToString:@"rootless"] || MCPDirectoryExists(@"/var/jb")) {
+        if (![packageScheme isEqualToString:@"roothide"]) {
+            type = @"rootless";
+        }
+        rootPath = @"/var/jb";
+    }
+
+    NSMutableDictionary *info = [@{
+        @"type": type ?: @"unknown",
+        @"packageScheme": packageScheme ?: @"unknown",
+        @"packageArchitecture": packageArchitecture ?: @"unknown",
+        @"rootPath": rootPath ?: @""
+    } mutableCopy];
+
+    if (debug) {
+        info[@"helpers"] = @{
+            @"mcpRoot": MCPHelperExecutableStatus(@"/usr/bin/mcp-root")
+        };
+    }
+
+    return [info copy];
+}
+
+static NSArray<NSString *> *MCPLockGuardAllowedTools(void) {
+    static NSArray<NSString *> *tools = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        tools = @[
+            @"get_device_info"
+        ];
+    });
+    return tools;
+}
+
+static BOOL MCPLockGuardToolAllowed(NSString *toolName) {
+    if (toolName.length == 0) return NO;
+    return [MCPLockGuardAllowedTools() containsObject:toolName];
+}
+
+static BOOL MCPStateBool(NSDictionary *state, NSString *key, BOOL *outValue) {
+    id value = [state isKindOfClass:[NSDictionary class]] ? state[key] : nil;
+    if (!value || value == [NSNull null] || ![value respondsToSelector:@selector(boolValue)]) {
+        return NO;
+    }
+    if (outValue) *outValue = [value boolValue];
+    return YES;
+}
+
+static BOOL MCPDeviceStateRequiresWakeOrUnlock(NSDictionary *state) {
+    BOOL locked = NO;
+    if (MCPStateBool(state, @"locked", &locked) && locked) {
+        return YES;
+    }
+
+    BOOL lockScreenVisible = NO;
+    if (MCPStateBool(state, @"lock_screen_visible", &lockScreenVisible) && lockScreenVisible) {
+        return YES;
+    }
+
+    BOOL screenOn = YES;
+    if (MCPStateBool(state, @"screen_on", &screenOn) && !screenOn) {
+        return YES;
+    }
+
+    return NO;
+}
+
+static double MCPRandomUnit(void) {
+    return ((double)arc4random_uniform(1000000) / 1000000.0);
+}
+
+static double MCPRoundedScreenPoint(double value) {
+    return round(value * 10.0) / 10.0;
+}
+
+static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
+    if (![element isKindOfClass:[NSDictionary class]]) {
+        return nil;
+    }
+
+    NSDictionary *rect = [element[@"visible_rect"] isKindOfClass:[NSDictionary class]] ? element[@"visible_rect"] : nil;
+    if (!rect) {
+        rect = [element[@"rect"] isKindOfClass:[NSDictionary class]] ? element[@"rect"] : nil;
+    }
+
+    double x = 0.0;
+    double y = 0.0;
+    double width = 0.0;
+    double height = 0.0;
+
+    if (!MCPRectValuesFromDictionary(rect, &x, &y, &width, &height)) {
+        NSDictionary *tap = [element[@"tap"] isKindOfClass:[NSDictionary class]] ? element[@"tap"] : nil;
+        return tap;
+    }
+
+    // 控制随机点击范围：只在 rect 中间区域随机
+    // 0.5 表示中间 50% 区域
+    // 例如 rect: x=0 y=0 width=80 height=40
+    // 最终随机区域: x=20 y=10 width=40 height=20
+    double centerRatio = 0.5;
+
+    double tapWidth = width * centerRatio;
+    double tapHeight = height * centerRatio;
+
+    double minX = x + (width - tapWidth) / 2.0;
+    double maxX = minX + tapWidth;
+
+    double minY = y + (height - tapHeight) / 2.0;
+    double maxY = minY + tapHeight;
+
+    double tapX = minX + ((maxX - minX) * MCPRandomUnit());
+    double tapY = minY + ((maxY - minY) * MCPRandomUnit());
+
+    tapX = MIN(MAX(tapX, x), x + width);
+    tapY = MIN(MAX(tapY, y), y + height);
+
+    return @{
+        @"x": @(MCPRoundedScreenPoint(tapX)),
+        @"y": @(MCPRoundedScreenPoint(tapY))
+    };
+}
+
+
+@interface MCPServer ()
++ (instancetype)sharedInstance;
+- (instancetype)init;
+- (void)startOnPort:(uint16_t)port;
+- (void)stop;
+- (void)handleClient:(int)clientSocket;
+- (NSData *)readChunkedMCPBodyFromSocket:(int)clientSocket
+                             initialBody:(const char *)initialBody
+                       initialBodyLength:(ssize_t)initialBodyLength
+                             errorStatus:(int *)errorStatus
+                            errorMessage:(NSString **)errorMessage;
+- (void)handleMCPRequest:(NSData *)bodyData clientSocket:(int)clientSocket;
+- (NSDictionary *)routeMCPRequest:(NSDictionary *)request;
+- (NSDictionary *)handleInitialize:(id)reqId;
+- (NSDictionary *)handleToolsList:(id)reqId;
+- (NSDictionary *)handleToolsCall:(id)reqId params:(NSDictionary *)params;
+- (NSDictionary *)lockedScreenGuardResponseForTool:(NSString *)toolName reqId:(id)reqId;
+- (NSDictionary *)executeGetDeviceInfo:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeRunCommand:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)mcpSuccess:(id)reqId text:(NSString *)text;
+- (NSDictionary *)mcpSuccess:(id)reqId text:(NSString *)text isError:(BOOL)isError;
+- (NSDictionary *)mcpError:(id)reqId code:(NSInteger)code message:(NSString *)message;
+- (void)sendJSONResponse:(int)socket status:(int)status body:(NSDictionary *)body;
+- (void)sendErrorResponse:(int)socket status:(int)status message:(NSString *)message;
+- (void)sendMethodNotAllowedResponse:(int)socket allowedMethods:(NSString *)allowedMethods message:(NSString *)message;
+- (void)sendEmptyResponse:(int)socket status:(int)status;
+- (void)writeAll:(int)socket data:(NSData *)data;
+@end
+
+@implementation MCPServer {
+    int _serverSocket;
+    dispatch_source_t _acceptSource;
+    dispatch_queue_t _clientQueue;
+    NSString *_sessionId;
+}
+
++ (instancetype)sharedInstance {
+    static MCPServer *instance;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        instance = [[MCPServer alloc] init];
+    });
+    return instance;
+}
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _serverSocket = -1;
+        _clientQueue = dispatch_queue_create("com.susu.mcp.client", DISPATCH_QUEUE_CONCURRENT);
+        _sessionId = [[NSUUID UUID] UUIDString];
+    }
+    return self;
+}
+
+#pragma mark - Server Lifecycle
+
+- (void)startOnPort:(uint16_t)port {
+    if (_running) return;
+
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        MCP_LOG(@"Failed to create socket: %s", strerror(errno));
+        return;
+    }
+
+    int reuse = 1;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons(port);
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        MCP_LOG(@"Failed to bind on port %d: %s", port, strerror(errno));
+        close(sock);
+        return;
+    }
+
+    if (listen(sock, 8) < 0) {
+        MCP_LOG(@"Failed to listen: %s", strerror(errno));
+        close(sock);
+        return;
+    }
+
+    _serverSocket = sock;
+    _port = port;
+    _running = YES;
+
+    dispatch_queue_t queue = dispatch_queue_create("com.susu.mcp.accept", DISPATCH_QUEUE_CONCURRENT);
+    _acceptSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, sock, 0, queue);
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_source_set_event_handler(_acceptSource, ^{
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self) return;
+        int client = accept(sock, NULL, NULL);
+        if (client >= 0) {
+            dispatch_async(self->_clientQueue, ^{
+                [self handleClient:client];
+            });
+        }
+    });
+
+    dispatch_source_set_cancel_handler(_acceptSource, ^{
+        close(sock);
+    });
+
+    dispatch_resume(_acceptSource);
+    MCP_LOG(@"MCP server started on port %d", port);
+}
+
+- (void)stop {
+    if (!_running) return;
+    _running = NO;
+    if (_acceptSource) {
+        dispatch_source_cancel(_acceptSource);
+        _acceptSource = nil;
+    }
+    _serverSocket = -1;
+    MCP_LOG(@"MCP server stopped");
+}
+
+#pragma mark - HTTP Handling
+
+- (void)handleClient:(int)clientSocket {
+    // Set read timeout
+    struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
+    setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    char *buffer = malloc(HTTP_BUF_SIZE);
+    if (!buffer) { close(clientSocket); return; }
+
+    ssize_t totalRead = 0;
+    ssize_t headerEnd = -1;
+
+    // Read until we have all headers (\r\n\r\n)
+    while (totalRead < HTTP_BUF_SIZE - 1) {
+        ssize_t n = read(clientSocket, buffer + totalRead, HTTP_BUF_SIZE - 1 - totalRead);
+        if (n <= 0) break;
+        totalRead += n;
+        buffer[totalRead] = '\0';
+
+        // Check for header termination
+        char *sep = strstr(buffer, "\r\n\r\n");
+        if (sep) {
+            headerEnd = sep - buffer + 4;
+            break;
+        }
+    }
+
+    if (headerEnd < 0) {
+        [self sendErrorResponse:clientSocket status:400 message:@"Bad Request"];
+        free(buffer);
+        close(clientSocket);
+        return;
+    }
+
+    // Parse request line and headers
+    NSString *headerStr = [[NSString alloc] initWithBytes:buffer length:headerEnd encoding:NSUTF8StringEncoding];
+    NSString *method = nil;
+    NSString *path = nil;
+    NSInteger contentLength = -1;
+    NSMutableDictionary *headers = [NSMutableDictionary dictionary];
+
+    NSArray *lines = [headerStr componentsSeparatedByString:@"\r\n"];
+    if (lines.count > 0) {
+        NSArray *parts = [lines[0] componentsSeparatedByString:@" "];
+        if (parts.count >= 2) {
+            method = parts[0];
+            path = parts[1];
+        }
+    }
+
+    for (NSString *line in lines) {
+        NSRange colon = [line rangeOfString:@":"];
+        if (colon.location == NSNotFound) continue;
+        NSString *name = [[line substringToIndex:colon.location] lowercaseString];
+        NSString *value = [[line substringFromIndex:colon.location + 1] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if (name.length > 0) {
+            headers[name] = value ?: @"";
+        }
+    }
+    NSString *contentLengthHeader = headers[@"content-length"];
+    if (contentLengthHeader.length > 0) {
+        contentLength = contentLengthHeader.integerValue;
+    }
+    NSString *transferEncoding = [headers[@"transfer-encoding"] lowercaseString] ?: @"";
+    BOOL chunkedBody = [transferEncoding containsString:@"chunked"];
+
+    ssize_t bodyReceived = totalRead - headerEnd;
+    NSString *basePath = MCPBasePath(path);
+
+    // Route request
+    if ([method isEqualToString:@"POST"] && [basePath isEqualToString:@"/mcp"]) {
+        NSString *expect = [headers[@"expect"] lowercaseString] ?: @"";
+        if ([expect containsString:@"100-continue"]) {
+            NSData *continueData = [@"HTTP/1.1 100 Continue\r\n\r\n" dataUsingEncoding:NSUTF8StringEncoding];
+            [self writeAll:clientSocket data:continueData];
+        }
+
+        if (chunkedBody) {
+            int errorStatus = 400;
+            NSString *errorMessage = nil;
+            NSData *bodyData = [self readChunkedMCPBodyFromSocket:clientSocket
+                                                      initialBody:buffer + headerEnd
+                                                initialBodyLength:MAX((ssize_t)0, bodyReceived)
+                                                      errorStatus:&errorStatus
+                                                     errorMessage:&errorMessage];
+            if (!bodyData) {
+                [self sendErrorResponse:clientSocket status:errorStatus message:errorMessage ?: @"Invalid chunked MCP request body"];
+                free(buffer);
+                close(clientSocket);
+                return;
+            }
+
+            [self handleMCPRequest:bodyData clientSocket:clientSocket];
+            free(buffer);
+            close(clientSocket);
+            return;
+        }
+
+        if (contentLength < 0) contentLength = 0;
+        if (contentLength > HTTP_BUF_SIZE - headerEnd - 1) {
+            [self sendErrorResponse:clientSocket status:413 message:@"MCP request body too large"];
+            free(buffer);
+            close(clientSocket);
+            return;
+        }
+
+        while (bodyReceived < contentLength && totalRead < HTTP_BUF_SIZE - 1) {
+            ssize_t n = read(clientSocket, buffer + totalRead, MIN(HTTP_BUF_SIZE - 1 - totalRead, contentLength - bodyReceived));
+            if (n <= 0) break;
+            totalRead += n;
+            bodyReceived += n;
+        }
+        buffer[totalRead] = '\0';
+
+        if (bodyReceived < contentLength) {
+            [self sendErrorResponse:clientSocket status:400 message:@"Incomplete MCP request body"];
+            free(buffer);
+            close(clientSocket);
+            return;
+        }
+
+        NSData *bodyData = [NSData dataWithBytes:buffer + headerEnd length:MIN(bodyReceived, contentLength)];
+        [self handleMCPRequest:bodyData clientSocket:clientSocket];
+    } else if ([basePath isEqualToString:@"/mcp"]) {
+        [self sendMethodNotAllowedResponse:clientSocket allowedMethods:@"POST" message:@"Method Not Allowed"];
+    } else if ([method isEqualToString:@"GET"] && [basePath isEqualToString:@"/health"]) {
+        NSDictionary *health = @{@"status": @"ok", @"server": MCP_SERVER_NAME, @"version": MCP_SERVER_VERSION};
+        [self sendJSONResponse:clientSocket status:200 body:health];
+    } else {
+        [self sendErrorResponse:clientSocket status:404 message:@"Not Found"];
+    }
+
+    free(buffer);
+    close(clientSocket);
+}
+
+- (NSData *)readChunkedMCPBodyFromSocket:(int)clientSocket
+                             initialBody:(const char *)initialBody
+                       initialBodyLength:(ssize_t)initialBodyLength
+                             errorStatus:(int *)errorStatus
+                            errorMessage:(NSString **)errorMessage {
+    NSMutableData *encoded = [NSMutableData data];
+    if (initialBody && initialBodyLength > 0) {
+        [encoded appendBytes:initialBody length:(NSUInteger)initialBodyLength];
+    }
+
+    NSMutableData *decoded = [NSMutableData data];
+    NSUInteger offset = 0;
+
+    BOOL (^readMore)(void) = ^BOOL {
+        uint8_t chunk[64 * 1024];
+        while (YES) {
+            ssize_t n = read(clientSocket, chunk, sizeof(chunk));
+            if (n < 0 && errno == EINTR) {
+                continue;
+            }
+            if (n <= 0) {
+                return NO;
+            }
+            [encoded appendBytes:chunk length:(NSUInteger)n];
+            return YES;
+        }
+    };
+
+    while (YES) {
+        NSRange lineEnd = MCPFindCRLF(encoded, offset);
+        while (lineEnd.location == NSNotFound) {
+            if (encoded.length >= offset && encoded.length - offset > MCP_MAX_CHUNK_LINE) {
+                MCPSetHTTPBodyError(errorStatus, errorMessage, 400, @"Malformed chunked MCP request body");
+                return nil;
+            }
+            if (!readMore()) {
+                MCPSetHTTPBodyError(errorStatus, errorMessage, 400, @"Incomplete chunked MCP request body");
+                return nil;
+            }
+            lineEnd = MCPFindCRLF(encoded, offset);
+        }
+
+        NSData *lineData = [encoded subdataWithRange:NSMakeRange(offset, lineEnd.location - offset)];
+        unsigned long long chunkSize = 0;
+        if (!MCPParseHTTPChunkSize(lineData, &chunkSize)) {
+            MCPSetHTTPBodyError(errorStatus, errorMessage, 400, @"Malformed chunked MCP request body");
+            return nil;
+        }
+
+        offset = lineEnd.location + 2;
+        if (chunkSize == 0) {
+            return [decoded copy];
+        }
+
+        if (chunkSize > (unsigned long long)HTTP_BUF_SIZE ||
+            decoded.length > HTTP_BUF_SIZE - (NSUInteger)chunkSize) {
+            MCPSetHTTPBodyError(errorStatus, errorMessage, 413, @"MCP request body too large");
+            return nil;
+        }
+
+        NSUInteger chunkLength = (NSUInteger)chunkSize;
+        NSUInteger needed = chunkLength + 2;
+        while (encoded.length < offset || encoded.length - offset < needed) {
+            if (!readMore()) {
+                MCPSetHTTPBodyError(errorStatus, errorMessage, 400, @"Incomplete chunked MCP request body");
+                return nil;
+            }
+        }
+
+        const uint8_t *bytes = encoded.bytes;
+        if (bytes[offset + chunkLength] != '\r' || bytes[offset + chunkLength + 1] != '\n') {
+            MCPSetHTTPBodyError(errorStatus, errorMessage, 400, @"Malformed chunked MCP request body");
+            return nil;
+        }
+
+        [decoded appendBytes:bytes + offset length:chunkLength];
+        offset += needed;
+
+        if (offset > 64 * 1024) {
+            [encoded replaceBytesInRange:NSMakeRange(0, offset) withBytes:NULL length:0];
+            offset = 0;
+        }
+    }
+}
+
+- (void)handleMCPRequest:(NSData *)bodyData clientSocket:(int)clientSocket {
+    @try {
+        NSError *jsonError;
+        id jsonObj = [NSJSONSerialization JSONObjectWithData:bodyData options:0 error:&jsonError];
+        if (jsonError || ![jsonObj isKindOfClass:[NSDictionary class]]) {
+            NSDictionary *errResp = @{
+                @"jsonrpc": @"2.0",
+                @"id": [NSNull null],
+                @"error": @{@"code": @(-32700), @"message": @"Parse error"}
+            };
+            [self sendJSONResponse:clientSocket status:200 body:errResp];
+            return;
+        }
+
+        NSDictionary *request = (NSDictionary *)jsonObj;
+        NSDictionary *response = [self routeMCPRequest:request];
+
+        if (response) {
+            [self sendJSONResponse:clientSocket status:200 body:response];
+        } else {
+            // Notification — no response needed, but send 202
+            [self sendEmptyResponse:clientSocket status:202];
+        }
+    } @catch (NSException *exception) {
+        MCP_LOG(@"Unhandled exception while processing MCP request: %@ - %@", exception.name, exception.reason);
+        NSDictionary *errResp = @{
+            @"jsonrpc": @"2.0",
+            @"id": [NSNull null],
+            @"error": @{
+                @"code": @(-32000),
+                @"message": [NSString stringWithFormat:@"Internal server exception: %@", exception.reason ?: exception.name ?: @"unknown"]
+            }
+        };
+        [self sendJSONResponse:clientSocket status:200 body:errResp];
+    }
+}
+
+#pragma mark - MCP Protocol Router
+
+- (NSDictionary *)routeMCPRequest:(NSDictionary *)request {
+    id methodValue = request[@"method"];
+    NSString *method = [methodValue isKindOfClass:[NSString class]] ? methodValue : nil;
+    id reqId = request[@"id"];
+    id paramsValue = request[@"params"];
+    NSDictionary *params = nil;
+
+    if (!method) {
+        return [self mcpError:reqId code:-32600 message:@"Invalid request: method must be a string"];
+    }
+
+    if (!paramsValue || paramsValue == [NSNull null]) {
+        params = @{};
+    } else if ([paramsValue isKindOfClass:[NSDictionary class]]) {
+        params = paramsValue;
+    } else {
+        return [self mcpError:reqId code:-32602 message:@"Invalid params: expected object"];
+    }
+
+    if ([method isEqualToString:@"initialize"]) {
+        return [self handleInitialize:reqId];
+    } else if ([method isEqualToString:@"notifications/initialized"]) {
+        return nil; // notification, no response
+    } else if ([method isEqualToString:@"ping"]) {
+        return @{@"jsonrpc": @"2.0", @"id": reqId ?: [NSNull null], @"result": @{}};
+    } else if ([method isEqualToString:@"tools/list"]) {
+        return [self handleToolsList:reqId];
+    } else if ([method isEqualToString:@"tools/call"]) {
+        return [self handleToolsCall:reqId params:params];
+    } else {
+        return @{
+            @"jsonrpc": @"2.0",
+            @"id": reqId ?: [NSNull null],
+            @"error": @{@"code": @(-32601), @"message": [NSString stringWithFormat:@"Method not found: %@", method]}
+        };
+    }
+}
+
+#pragma mark - MCP: initialize
+
+- (NSDictionary *)handleInitialize:(id)reqId {
+    return @{
+        @"jsonrpc": @"2.0",
+        @"id": reqId ?: [NSNull null],
+        @"result": @{
+            @"protocolVersion": MCP_PROTOCOL_VERSION,
+            @"capabilities": @{
+                @"tools": @{@"listChanged": @NO}
+            },
+            @"serverInfo": @{
+                @"name": MCP_SERVER_NAME,
+                @"version": MCP_SERVER_VERSION
+            },
+            @"instructions": @"Use com.susu.mcp to inspect the connected iPhone and run shell commands.\n\nDevice info: get_device_info for model, iOS version, battery, storage, memory, and jailbreak type/package information.\n\nShell: run_command executes shell commands on the device (timeout default 10s, max 30s).\n\nHealth checks: avoid shell brace expansion such as for i in {1..30}; use seq or a while loop, and set request timeouts for /health."
+        }
+    };
+}
+
+#pragma mark - MCP: tools/list
+
+- (NSDictionary *)handleToolsList:(id)reqId {
+    NSArray *tools = @[
+        @{
+            @"name": @"get_device_info",
+            @"description": @"Get device information including model, iOS version, battery level, storage, memory, and jailbreak type/package information",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"debug": @{@"type": @"boolean", @"description": @"Include diagnostic helper executable status (default: false)"}
+                }
+            }
+        },
+        @{
+            @"name": @"run_command",
+            @"description": @"Execute a shell command on the device and return stdout/stderr output. Use for file operations, process management, system queries, etc.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"command": @{@"type": @"string", @"description": @"Shell command to execute (e.g. ls -la, uname -a, cat /etc/hosts)"},
+                    @"timeout": @{@"type": @"number", @"description": @"Timeout in seconds (default: 10, max: 30)"}
+                },
+                @"required": @[@"command"]
+            }
+        }
+    ];
+
+    return @{
+        @"jsonrpc": @"2.0",
+        @"id": reqId ?: [NSNull null],
+        @"result": @{@"tools": tools}
+    };
+}
+
+#pragma mark - MCP: tools/call
+
+- (NSDictionary *)handleToolsCall:(id)reqId params:(NSDictionary *)params {
+    if (![params isKindOfClass:[NSDictionary class]]) {
+        return [self mcpError:reqId code:-32602 message:@"Invalid params: expected object"];
+    }
+
+    id toolNameValue = params[@"name"];
+    NSString *toolName = [toolNameValue isKindOfClass:[NSString class]] ? toolNameValue : nil;
+
+    id argsValue = params[@"arguments"];
+    NSDictionary *args = nil;
+    if (!argsValue || argsValue == [NSNull null]) {
+        args = @{};
+    } else if ([argsValue isKindOfClass:[NSDictionary class]]) {
+        args = argsValue;
+    } else {
+        return [self mcpError:reqId code:-32602 message:@"Invalid arguments: expected object"];
+    }
+
+    if (!toolName) {
+        return [self mcpError:reqId code:-32602 message:@"Missing tool name"];
+    }
+
+    NSDictionary *lockGuardResponse = [self lockedScreenGuardResponseForTool:toolName reqId:reqId];
+    if (lockGuardResponse) {
+        return lockGuardResponse;
+    }
+
+    if ([toolName isEqualToString:@"get_device_info"]) {
+        return [self executeGetDeviceInfo:reqId args:args];
+    } else if ([toolName isEqualToString:@"run_command"]) {
+        return [self executeRunCommand:reqId args:args];
+    }
+    return [self mcpError:reqId code:-32602 message:[NSString stringWithFormat:@"Unknown tool: %@", toolName]];
+}
+
+- (NSDictionary *)lockedScreenGuardResponseForTool:(NSString *)toolName reqId:(id)reqId {
+    if (MCPLockGuardToolAllowed(toolName)) {
+        return nil;
+    }
+
+    NSDictionary *state = [[ScreenManager sharedInstance] deviceInteractionState];
+    if (!MCPDeviceStateRequiresWakeOrUnlock(state)) {
+        return nil;
+    }
+
+    NSDictionary *payload = @{
+        @"blocked": @YES,
+        @"tool": toolName ?: @"",
+        @"reason": @"device_locked_or_screen_off",
+        @"device_state": state ?: @{},
+        @"allowed_tools": MCPLockGuardAllowedTools(),
+        @"next_step": @"Unlock or wake the device manually before retrying the blocked tool."
+    };
+    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
+    NSString *jsonStr = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
+    return [self mcpSuccess:reqId text:jsonStr ?: @"Tool blocked while device is locked or screen is off" isError:YES];
+}
+
+#pragma mark - Tool Execution Helpers
+
+#pragma mark - Enhanced Gesture Execution
+
+- (NSDictionary *)executeGetDeviceInfo:(id)reqId args:(NSDictionary *)args {
+    NSString *paramError = nil;
+    BOOL debug = NO;
+    if (!MCPBoolFromArgs(args, @"debug", NO, &debug, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+
+    __block NSDictionary *info = nil;
+
+    dispatch_block_t block = ^{
+        NSMutableDictionary *result = [NSMutableDictionary dictionary];
+
+        // Device model and name
+        struct utsname systemInfo;
+        uname(&systemInfo);
+        result[@"machine"] = [NSString stringWithCString:systemInfo.machine encoding:NSUTF8StringEncoding] ?: @"unknown";
+        result[@"deviceName"] = [[UIDevice currentDevice] name] ?: @"unknown";
+        result[@"systemName"] = [[UIDevice currentDevice] systemName] ?: @"unknown";
+        result[@"systemVersion"] = [[UIDevice currentDevice] systemVersion] ?: @"unknown";
+        result[@"model"] = [[UIDevice currentDevice] model] ?: @"unknown";
+        result[@"jailbreak"] = MCPJailbreakInfo(debug);
+
+        // Battery
+        [[UIDevice currentDevice] setBatteryMonitoringEnabled:YES];
+        float batteryLevel = [[UIDevice currentDevice] batteryLevel];
+        UIDeviceBatteryState batteryState = [[UIDevice currentDevice] batteryState];
+        result[@"batteryLevel"] = batteryLevel >= 0 ? @(batteryLevel * 100) : @(-1);
+        NSString *stateStr = @"unknown";
+        switch (batteryState) {
+            case UIDeviceBatteryStateUnplugged: stateStr = @"unplugged"; break;
+            case UIDeviceBatteryStateCharging:  stateStr = @"charging"; break;
+            case UIDeviceBatteryStateFull:      stateStr = @"full"; break;
+            default: break;
+        }
+        result[@"batteryState"] = stateStr;
+
+        // Storage
+        struct statvfs stat;
+        if (statvfs("/var", &stat) == 0) {
+            unsigned long long freeBytes = (unsigned long long)stat.f_bavail * stat.f_frsize;
+            unsigned long long totalBytes = (unsigned long long)stat.f_blocks * stat.f_frsize;
+            result[@"storageFreeBytes"] = @(freeBytes);
+            result[@"storageTotalBytes"] = @(totalBytes);
+            result[@"storageFreeGB"] = @(freeBytes / (1024.0 * 1024.0 * 1024.0));
+            result[@"storageTotalGB"] = @(totalBytes / (1024.0 * 1024.0 * 1024.0));
+        }
+
+        // Memory
+        mach_port_t host = mach_host_self();
+        vm_size_t pageSize;
+        host_page_size(host, &pageSize);
+        vm_statistics64_data_t vmStat;
+        mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+        if (host_statistics64(host, HOST_VM_INFO64, (host_info64_t)&vmStat, &count) == KERN_SUCCESS) {
+            unsigned long long freeMemory = (unsigned long long)vmStat.free_count * pageSize;
+            unsigned long long totalMemory = [NSProcessInfo processInfo].physicalMemory;
+            result[@"memoryFreeBytes"] = @(freeMemory);
+            result[@"memoryTotalBytes"] = @(totalMemory);
+            result[@"memoryFreeMB"] = @(freeMemory / (1024.0 * 1024.0));
+            result[@"memoryTotalMB"] = @(totalMemory / (1024.0 * 1024.0));
+        }
+
+        // Screen
+        UIScreen *screen = [UIScreen mainScreen];
+        result[@"screenWidth"] = @(screen.bounds.size.width);
+        result[@"screenHeight"] = @(screen.bounds.size.height);
+        result[@"screenScale"] = @(screen.scale);
+
+        // Uptime
+        result[@"uptimeSeconds"] = @([NSProcessInfo processInfo].systemUptime);
+
+        info = [result copy];
+    };
+
+    if ([NSThread isMainThread]) {
+        block();
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), block);
+    }
+
+    if (info) {
+        NSData *jsonData = [NSJSONSerialization dataWithJSONObject:info options:0 error:nil];
+        NSString *jsonStr = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
+        return [self mcpSuccess:reqId text:jsonStr];
+    }
+    return [self mcpSuccess:reqId text:@"Failed to get device info" isError:YES];
+}
+
+#pragma mark - Shell Command Execution
+
+- (NSDictionary *)executeRunCommand:(id)reqId args:(NSDictionary *)args {
+    NSString *paramError = nil;
+    NSString *command = nil;
+    if (!MCPStringFromArgs(args, @"command", YES, &command, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+
+    double timeoutSec = 10;
+    if (!MCPNumberFromArgs(args, @"timeout", 10, NO, &timeoutSec, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    if (timeoutSec <= 0) timeoutSec = 10;
+    if (timeoutSec > 30) timeoutSec = 30;
+
+    NSString *shellPath = MCPResolvedJailbreakPath(@"/bin/sh");
+    NSString *output = nil;
+    NSString *runError = nil;
+    int exitCode = -1;
+    BOOL finished = MCPRunProcess(shellPath,
+                                  @[@"-lc", command],
+                                  MCPJailbreakEnvironment(),
+                                  timeoutSec,
+                                  512 * 1024,
+                                  &output,
+                                  &exitCode,
+                                  &runError);
+
+    if (!finished && [runError hasPrefix:@"Command timed out"]) {
+        return [self mcpSuccess:reqId text:runError isError:YES];
+    }
+
+    NSMutableDictionary *resultDict = [@{
+        @"exitCode": @(exitCode),
+        @"output": output ?: @""
+    } mutableCopy];
+    if (runError.length > 0) {
+        resultDict[@"error"] = runError;
+    }
+    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:resultDict options:0 error:nil];
+    NSString *jsonStr = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
+
+    if (!finished || exitCode != 0) {
+        return [self mcpSuccess:reqId text:jsonStr isError:YES];
+    }
+    return [self mcpSuccess:reqId text:jsonStr];
+}
+
+#pragma mark - Response Builders
+
+- (NSDictionary *)mcpSuccess:(id)reqId text:(NSString *)text {
+    return [self mcpSuccess:reqId text:text isError:NO];
+}
+
+- (NSDictionary *)mcpSuccess:(id)reqId text:(NSString *)text isError:(BOOL)isError {
+    NSMutableDictionary *result = [NSMutableDictionary dictionary];
+    result[@"content"] = @[@{@"type": @"text", @"text": text}];
+    if (isError) result[@"isError"] = @YES;
+
+    return @{
+        @"jsonrpc": @"2.0",
+        @"id": reqId ?: [NSNull null],
+        @"result": result
+    };
+}
+
+- (NSDictionary *)mcpError:(id)reqId code:(NSInteger)code message:(NSString *)message {
+    return @{
+        @"jsonrpc": @"2.0",
+        @"id": reqId ?: [NSNull null],
+        @"error": @{@"code": @(code), @"message": message}
+    };
+}
+
+#pragma mark - HTTP Response Helpers
+
+- (void)sendJSONResponse:(int)socket status:(int)status body:(NSDictionary *)body {
+    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+    if (!jsonData) {
+        [self sendErrorResponse:socket status:500 message:@"JSON serialization error"];
+        return;
+    }
+
+    NSString *response = [NSString stringWithFormat:
+        @"HTTP/1.1 %d OK\r\n"
+        @"Content-Type: application/json\r\n"
+        @"Content-Length: %lu\r\n"
+        @"Mcp-Session-Id: %@\r\n"
+        @"Connection: close\r\n"
+        @"\r\n",
+        status, (unsigned long)jsonData.length, _sessionId];
+
+    NSMutableData *responseData = [NSMutableData dataWithData:[response dataUsingEncoding:NSUTF8StringEncoding]];
+    [responseData appendData:jsonData];
+
+    [self writeAll:socket data:responseData];
+}
+
+- (void)sendErrorResponse:(int)socket status:(int)status message:(NSString *)message {
+    NSString *statusText;
+    switch (status) {
+        case 400: statusText = @"Bad Request"; break;
+        case 411: statusText = @"Length Required"; break;
+        case 413: statusText = @"Payload Too Large"; break;
+        case 415: statusText = @"Unsupported Media Type"; break;
+        case 404: statusText = @"Not Found"; break;
+        case 405: statusText = @"Method Not Allowed"; break;
+        case 500: statusText = @"Internal Server Error"; break;
+        default:  statusText = @"Error"; break;
+    }
+
+    NSDictionary *body = @{@"error": message};
+    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+
+    NSString *header = [NSString stringWithFormat:
+        @"HTTP/1.1 %d %@\r\n"
+        @"Content-Type: application/json\r\n"
+        @"Content-Length: %lu\r\n"
+        @"Connection: close\r\n"
+        @"\r\n",
+        status, statusText, (unsigned long)jsonData.length];
+
+    NSMutableData *responseData = [NSMutableData dataWithData:[header dataUsingEncoding:NSUTF8StringEncoding]];
+    [responseData appendData:jsonData];
+
+    [self writeAll:socket data:responseData];
+}
+
+- (void)sendMethodNotAllowedResponse:(int)socket allowedMethods:(NSString *)allowedMethods message:(NSString *)message {
+    NSDictionary *body = @{@"error": message ?: @"Method Not Allowed"};
+    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+
+    NSString *header = [NSString stringWithFormat:
+        @"HTTP/1.1 405 Method Not Allowed\r\n"
+        @"Content-Type: application/json\r\n"
+        @"Content-Length: %lu\r\n"
+        @"Allow: %@\r\n"
+        @"Connection: close\r\n"
+        @"\r\n",
+        (unsigned long)jsonData.length, allowedMethods ?: @"POST"];
+
+    NSMutableData *responseData = [NSMutableData dataWithData:[header dataUsingEncoding:NSUTF8StringEncoding]];
+    [responseData appendData:jsonData];
+
+    [self writeAll:socket data:responseData];
+}
+
+- (void)sendEmptyResponse:(int)socket status:(int)status {
+    NSString *response = [NSString stringWithFormat:
+        @"HTTP/1.1 %d Accepted\r\n"
+        @"Content-Length: 0\r\n"
+        @"Mcp-Session-Id: %@\r\n"
+        @"Connection: close\r\n"
+        @"\r\n",
+        status, _sessionId];
+
+    NSData *data = [response dataUsingEncoding:NSUTF8StringEncoding];
+    [self writeAll:socket data:data];
+}
+
+- (void)writeAll:(int)socket data:(NSData *)data {
+    const uint8_t *bytes = data.bytes;
+    NSUInteger remaining = data.length;
+    NSUInteger offset = 0;
+
+    while (remaining > 0) {
+        ssize_t written = write(socket, bytes + offset, remaining);
+        if (written <= 0) break;
+        offset += written;
+        remaining -= written;
+    }
+}
+
+@end
