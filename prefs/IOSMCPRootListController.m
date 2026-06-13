@@ -93,7 +93,7 @@
     [self updateControlStatusText:shouldStart ? @"当前状态：正在启动..." : @"当前状态：正在关闭..."
                       buttonTitle:shouldStart ? @"正在启动..." : @"正在关闭..."
                     buttonEnabled:NO];
-    [self updateAddressSpecifiersVisible:shouldStart];
+    [self updateAddressSpecifiersVisible:NO];
 
     [self scheduleServerStatusRefreshAfterDelay:0.8];
 }
@@ -105,6 +105,7 @@
     [self updateControlStatusText:@"当前状态：正在获取..."
                       buttonTitle:@"正在获取..."
                     buttonEnabled:NO];
+    [self updateAddressSpecifiersVisible:NO];
 
     __weak typeof(self) weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
