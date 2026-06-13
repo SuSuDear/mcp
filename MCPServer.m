@@ -961,21 +961,28 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
         }];
     };
 
-    __block void (^walk)(NSString *, NSInteger);
-    walk = ^(NSString *dir, NSInteger depth) {
-        NSArray *children = [[fm contentsOfDirectoryAtPath:dir error:nil] sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+    if (recursive) {
+        NSDirectoryEnumerator *enumerator = [fm enumeratorAtPath:root];
+        for (NSString *relative in enumerator) {
+            if (!includeHidden && [relative.lastPathComponent hasPrefix:@"."]) {
+                [enumerator skipDescendants];
+                continue;
+            }
+            NSInteger depth = [[relative pathComponents] count] - 1;
+            if (depth > maxDepth) {
+                [enumerator skipDescendants];
+                continue;
+            }
+            NSString *child = [root stringByAppendingPathComponent:relative];
+            addEntry(child, depth);
+        }
+    } else {
+        NSArray *children = [[fm contentsOfDirectoryAtPath:root error:nil] sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
         for (NSString *name in children) {
             if (!includeHidden && [name hasPrefix:@"."]) continue;
-            NSString *child = [dir stringByAppendingPathComponent:name];
-            BOOL childIsDir = NO;
-            [fm fileExistsAtPath:child isDirectory:&childIsDir];
-            addEntry(child, depth);
-            if (recursive && childIsDir && depth < maxDepth) {
-                walk(child, depth + 1);
-            }
+            addEntry([root stringByAppendingPathComponent:name], 0);
         }
-    };
-    walk(root, 0);
+    }
 
     NSDictionary *result = @{@"path": root, @"entries": entries};
     NSData *jsonData = [NSJSONSerialization dataWithJSONObject:result options:0 error:nil];
