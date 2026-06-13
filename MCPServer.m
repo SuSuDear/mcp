@@ -385,6 +385,7 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
 - (NSDictionary *)executeSearchFiles:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeGetDeviceInfo:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeRunCommand:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeFetchURL:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)mcpSuccess:(id)reqId text:(NSString *)text;
 - (NSDictionary *)mcpSuccess:(id)reqId text:(NSString *)text isError:(BOOL)isError;
 - (NSDictionary *)mcpError:(id)reqId code:(NSInteger)code message:(NSString *)message;
@@ -805,7 +806,7 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
                 @"name": MCP_SERVER_NAME,
                 @"version": MCP_SERVER_VERSION
             },
-            @"instructions": @"Use com.susu.mcp to inspect files on the connected iPhone and run shell commands.\n\nFiles: list_files lists directory contents, read_file reads text files, and search_files searches file contents.\n\nDevice info: get_device_info for model, iOS version, battery, storage, memory, and jailbreak type/package information.\n\nShell: run_command executes shell commands on the device (timeout default 10s, max 30s).\n\nHealth checks: avoid shell brace expansion such as for i in {1..30}; use seq or a while loop, and set request timeouts for /health."
+            @"instructions": @"Use com.susu.mcp to inspect files on the connected iPhone and run shell commands.\n\nFiles: list_files lists directory contents, read_file reads text files, and search_files searches file contents.\n\nDevice info: get_device_info for model, iOS version, battery, storage, memory, and jailbreak type/package information.\n\nShell: run_command executes shell commands on the device (timeout default 10s, max 30s).\n\nWeb: fetch_url fetches HTTP/HTTPS URL content.\n\nHealth checks: avoid shell brace expansion such as for i in {1..30}; use seq or a while loop, and set request timeouts for /health."
         }
     };
 }
@@ -877,6 +878,19 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
                 },
                 @"required": @[@"command"]
             }
+        },
+        @{
+            @"name": @"fetch_url",
+            @"description": @"Fetch HTTP/HTTPS URL content and return status code, headers, and body text",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"url": @{@"type": @"string", @"description": @"HTTP or HTTPS URL to fetch"},
+                    @"timeout": @{@"type": @"number", @"description": @"Timeout in seconds (default: 15, max: 30)"},
+                    @"max_bytes": @{@"type": @"integer", @"description": @"Maximum response bytes to return (default: 200000, max: 1048576)"}
+                },
+                @"required": @[@"url"]
+            }
         }
     ];
 
@@ -921,6 +935,8 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
         return [self executeGetDeviceInfo:reqId args:args];
     } else if ([toolName isEqualToString:@"run_command"]) {
         return [self executeRunCommand:reqId args:args];
+    } else if ([toolName isEqualToString:@"fetch_url"]) {
+        return [self executeFetchURL:reqId args:args];
     }
     return [self mcpError:reqId code:-32602 message:[NSString stringWithFormat:@"Unknown tool: %@", toolName]];
 }
@@ -1217,6 +1233,81 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
         return [self mcpSuccess:reqId text:jsonStr isError:YES];
     }
     return [self mcpSuccess:reqId text:jsonStr];
+}
+
+
+#pragma mark - URL Fetch Execution
+
+- (NSDictionary *)executeFetchURL:(id)reqId args:(NSDictionary *)args {
+    NSString *paramError = nil;
+    NSString *urlString = nil;
+    if (!MCPStringFromArgs(args, @"url", YES, &urlString, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+
+    NSURL *url = [NSURL URLWithString:urlString];
+    NSString *scheme = url.scheme.lowercaseString;
+    if (!url || !([scheme isEqualToString:@"http"] || [scheme isEqualToString:@"https"])) {
+        return [self mcpError:reqId code:-32602 message:@"Invalid url: only http and https are supported"];
+    }
+
+    double timeoutSec = 15;
+    if (!MCPNumberFromArgs(args, @"timeout", 15, NO, &timeoutSec, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    if (timeoutSec <= 0) timeoutSec = 15;
+    if (timeoutSec > 30) timeoutSec = 30;
+
+    NSInteger maxBytes = MCPIntegerFromArgs(args, @"max_bytes", 200000);
+    if (maxBytes <= 0) maxBytes = 200000;
+    if (maxBytes > 1024 * 1024) maxBytes = 1024 * 1024;
+
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+    request.HTTPMethod = @"GET";
+    request.timeoutInterval = timeoutSec;
+    [request setValue:@"com.susu.mcp/1.0" forHTTPHeaderField:@"User-Agent"];
+
+    __block NSData *responseData = nil;
+    __block NSURLResponse *urlResponse = nil;
+    __block NSError *requestError = nil;
+    dispatch_semaphore_t sema = dispatch_semaphore_create(0);
+    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        responseData = data;
+        urlResponse = response;
+        requestError = error;
+        dispatch_semaphore_signal(sema);
+    }];
+    [task resume];
+
+    long waitResult = dispatch_semaphore_wait(sema, dispatch_time(DISPATCH_TIME_NOW, (int64_t)((timeoutSec + 1) * NSEC_PER_SEC)));
+    if (waitResult != 0) {
+        [task cancel];
+        return [self mcpSuccess:reqId text:@"Request timed out" isError:YES];
+    }
+    if (requestError) {
+        return [self mcpSuccess:reqId text:requestError.localizedDescription ?: @"Request failed" isError:YES];
+    }
+
+    NSHTTPURLResponse *httpResponse = [urlResponse isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)urlResponse : nil;
+    BOOL truncated = NO;
+    NSData *bodyData = responseData ?: [NSData data];
+    if (bodyData.length > (NSUInteger)maxBytes) {
+        bodyData = [bodyData subdataWithRange:NSMakeRange(0, (NSUInteger)maxBytes)];
+        truncated = YES;
+    }
+    NSString *body = [[NSString alloc] initWithData:bodyData encoding:NSUTF8StringEncoding];
+    if (!body) body = [[NSString alloc] initWithData:bodyData encoding:NSISOLatin1StringEncoding] ?: @"";
+
+    NSDictionary *resultDict = @{
+        @"url": urlResponse.URL.absoluteString ?: urlString,
+        @"statusCode": @(httpResponse ? httpResponse.statusCode : 0),
+        @"headers": httpResponse.allHeaderFields ?: @{},
+        @"content": body ?: @"",
+        @"truncated": @(truncated)
+    };
+    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:resultDict options:0 error:nil];
+    NSString *jsonStr = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
+    return [self mcpSuccess:reqId text:jsonStr isError:(httpResponse && httpResponse.statusCode >= 400)];
 }
 
 #pragma mark - Response Builders
