@@ -1,0 +1,66 @@
+name: Build iOS MCP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - scheme_var: ""
+            artifact_name: rootful
+          - scheme_var: "THEOS_PACKAGE_SCHEME=rootless"
+            artifact_name: rootless
+          - scheme_var: "THEOS_PACKAGE_SCHEME=roothide"
+            artifact_name: roothide
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          brew install ldid make dpkg
+          echo "$(brew --prefix make)/libexec/gnubin" >> $GITHUB_PATH
+
+      - name: Install Theos
+        run: |
+          git clone --recursive https://github.com/roothide/theos.git "$GITHUB_WORKSPACE/theos"
+          echo "THEOS=$GITHUB_WORKSPACE/theos" >> "$GITHUB_ENV"
+
+
+      - name: Install iPhoneOS16.5 SDK
+        run: |
+          git init /tmp/iOS-SDKs
+          cd /tmp/iOS-SDKs
+          git remote add origin https://github.com/xybp888/iOS-SDKs.git
+          git sparse-checkout init --cone
+          git sparse-checkout set iPhoneOS16.5.sdk
+          git fetch --depth=1 --filter=blob:none origin 1b92ff4a8928f582876e1d388d1381c6a0c59eb9
+          git checkout FETCH_HEAD
+          mkdir -p "$THEOS/sdks"
+          rm -rf "$THEOS/sdks/iPhoneOS16.5.sdk"
+          cp -R iPhoneOS16.5.sdk "$THEOS/sdks/"
+
+      - name: Build mcp-root
+        working-directory: mcp-root
+        run: make ${{ matrix.scheme_var }}
+
+      - name: Build ios-mcp package
+        run: |
+          make clean
+          make package ${{ matrix.scheme_var }}
+
+      - name: Upload deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-mcp-${{ matrix.artifact_name }}
+          path: |
+            packages/*.deb
+          if-no-files-found: error
