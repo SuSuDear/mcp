@@ -13,7 +13,7 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = com.susu.mcp
 BUNDLE_NAME = iosmcpprefs
 
-com.susu.mcp_FILES = Tweak.x MCPServer.m ScreenManager.m MCPProcessUtil.m
+com.susu.mcp_FILES = Tweak.x MCPServer.m MCPProcessUtil.m
 com.susu.mcp_CFLAGS = -fobjc-arc -Wno-unused-function -Wno-deprecated-declarations
 com.susu.mcp_FRAMEWORKS = IOKit UIKit CoreGraphics QuartzCore MobileCoreServices AVFoundation Security
 
