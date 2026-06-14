@@ -882,13 +882,14 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
         },
         @{
             @"name": @"fetch_url",
-            @"description": @"Fetch HTTP/HTTPS URL content and return status code, headers, and body text",
+            @"description": @"Fetch HTTP/HTTPS URL content and return status code, headers, body text, and optional parsed content",
             @"inputSchema": @{
                 @"type": @"object",
                 @"properties": @{
                     @"url": @{@"type": @"string", @"description": @"HTTP or HTTPS URL to fetch"},
                     @"timeout": @{@"type": @"number", @"description": @"Timeout in seconds (default: 15, max: 30)"},
-                    @"max_bytes": @{@"type": @"integer", @"description": @"Maximum response bytes to return (default: 200000, max: 1048576)"}
+                    @"max_bytes": @{@"type": @"integer", @"description": @"Maximum response bytes to return (default: 200000, max: 1048576)"},
+                    @"parse": @{@"type": @"string", @"description": @"Response parsing mode: auto, text, json, html, or none (default: auto)"}
                 },
                 @"required": @[@"url"]
             }
@@ -1253,12 +1254,71 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
 
 #pragma mark - URL Fetch Execution
 
+static NSString *MCPTrimmedString(NSString *s) {
+    return [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] ?: @"";
+}
+
+static NSString *MCPHTMLDecode(NSString *s) {
+    if (!s) return @"";
+    NSMutableString *m = [s mutableCopy];
+    NSDictionary *entities = @{@"&nbsp;": @" ", @"&amp;": @"&", @"&lt;": @"<", @"&gt;": @">", @"&quot;": @"\"", @"&#39;": @"'", @"&apos;": @"'"};
+    for (NSString *k in entities) [m replaceOccurrencesOfString:k withString:entities[k] options:NSCaseInsensitiveSearch range:NSMakeRange(0, m.length)];
+    return m;
+}
+
+static NSString *MCPFirstRegexGroup(NSString *text, NSString *pattern) {
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:pattern options:NSRegularExpressionCaseInsensitive|NSRegularExpressionDotMatchesLineSeparators error:nil];
+    NSTextCheckingResult *match = [re firstMatchInString:text ?: @"" options:0 range:NSMakeRange(0, (text ?: @"").length)];
+    if (!match || match.numberOfRanges < 2) return @"";
+    return MCPHTMLDecode([[text substringWithRange:[match rangeAtIndex:1]] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]]);
+}
+
+static NSDictionary *MCPParseHTML(NSString *body) {
+    NSString *html = body ?: @"";
+    NSMutableArray *headings = [NSMutableArray array];
+    NSRegularExpression *hRe = [NSRegularExpression regularExpressionWithPattern:@"<h([1-3])[^>]*>(.*?)</h\\1>" options:NSRegularExpressionCaseInsensitive|NSRegularExpressionDotMatchesLineSeparators error:nil];
+    for (NSTextCheckingResult *m in [hRe matchesInString:html options:0 range:NSMakeRange(0, html.length)]) {
+        NSString *level = [html substringWithRange:[m rangeAtIndex:1]];
+        NSString *text = [html substringWithRange:[m rangeAtIndex:2]];
+        text = [text stringByReplacingOccurrencesOfString:@"<[^>]+>" withString:@"" options:NSRegularExpressionSearch range:NSMakeRange(0, text.length)];
+        [headings addObject:@{@"level": @([level integerValue]), @"text": MCPHTMLDecode(MCPTrimmedString(text))}];
+        if (headings.count >= 50) break;
+    }
+
+    NSMutableArray *links = [NSMutableArray array];
+    NSRegularExpression *aRe = [NSRegularExpression regularExpressionWithPattern:@"<a[^>]+href=[\\\"']([^\\\"']+)[\\\"'][^>]*>(.*?)</a>" options:NSRegularExpressionCaseInsensitive|NSRegularExpressionDotMatchesLineSeparators error:nil];
+    for (NSTextCheckingResult *m in [aRe matchesInString:html options:0 range:NSMakeRange(0, html.length)]) {
+        NSString *href = [html substringWithRange:[m rangeAtIndex:1]];
+        NSString *text = [html substringWithRange:[m rangeAtIndex:2]];
+        text = [text stringByReplacingOccurrencesOfString:@"<[^>]+>" withString:@"" options:NSRegularExpressionSearch range:NSMakeRange(0, text.length)];
+        [links addObject:@{@"text": MCPHTMLDecode(MCPTrimmedString(text)), @"href": MCPHTMLDecode(href)}];
+        if (links.count >= 100) break;
+    }
+
+    NSString *plain = [html stringByReplacingOccurrencesOfString:@"<script[^>]*>.*?</script>" withString:@" " options:NSRegularExpressionSearch|NSCaseInsensitiveSearch range:NSMakeRange(0, html.length)];
+    plain = [plain stringByReplacingOccurrencesOfString:@"<style[^>]*>.*?</style>" withString:@" " options:NSRegularExpressionSearch|NSCaseInsensitiveSearch range:NSMakeRange(0, plain.length)];
+    plain = [plain stringByReplacingOccurrencesOfString:@"<[^>]+>" withString:@" " options:NSRegularExpressionSearch range:NSMakeRange(0, plain.length)];
+    plain = [plain stringByReplacingOccurrencesOfString:@"\\s+" withString:@" " options:NSRegularExpressionSearch range:NSMakeRange(0, plain.length)];
+
+    return @{@"title": MCPFirstRegexGroup(html, @"<title[^>]*>(.*?)</title>"),
+             @"description": MCPFirstRegexGroup(html, @"<meta[^>]+name=[\\\"']description[\\\"'][^>]+content=[\\\"']([^\\\"']*)[\\\"'][^>]*>"),
+             @"headings": headings,
+             @"links": links,
+             @"plainText": MCPHTMLDecode(MCPTrimmedString(plain))};
+}
+
 - (NSDictionary *)executeFetchURL:(id)reqId args:(NSDictionary *)args {
     NSString *paramError = nil;
     NSString *urlString = nil;
     if (!MCPStringFromArgs(args, @"url", YES, &urlString, &paramError)) {
         return [self mcpError:reqId code:-32602 message:paramError];
     }
+
+    NSString *parse = nil;
+    if (!MCPStringFromArgs(args, @"parse", NO, &parse, &paramError)) return [self mcpError:reqId code:-32602 message:paramError];
+    parse = (parse ?: @"auto").lowercaseString;
+    NSSet *allowedParse = [NSSet setWithArray:@[@"auto", @"text", @"json", @"html", @"none"]];
+    if (![allowedParse containsObject:parse]) return [self mcpError:reqId code:-32602 message:@"Invalid parse: expected auto, text, json, html, or none"];
 
     NSURL *url = [NSURL URLWithString:urlString];
     NSString *scheme = url.scheme.lowercaseString;
@@ -1267,9 +1327,7 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
     }
 
     double timeoutSec = 15;
-    if (!MCPNumberFromArgs(args, @"timeout", 15, NO, &timeoutSec, &paramError)) {
-        return [self mcpError:reqId code:-32602 message:paramError];
-    }
+    if (!MCPNumberFromArgs(args, @"timeout", 15, NO, &timeoutSec, &paramError)) return [self mcpError:reqId code:-32602 message:paramError];
     if (timeoutSec <= 0) timeoutSec = 15;
     if (timeoutSec > 30) timeoutSec = 30;
 
@@ -1299,9 +1357,7 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
         [task cancel];
         return [self mcpSuccess:reqId text:@"Request timed out" isError:YES];
     }
-    if (requestError) {
-        return [self mcpSuccess:reqId text:requestError.localizedDescription ?: @"Request failed" isError:YES];
-    }
+    if (requestError) return [self mcpSuccess:reqId text:requestError.localizedDescription ?: @"Request failed" isError:YES];
 
     NSHTTPURLResponse *httpResponse = [urlResponse isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)urlResponse : nil;
     BOOL truncated = NO;
@@ -1313,13 +1369,41 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
     NSString *body = [[NSString alloc] initWithData:bodyData encoding:NSUTF8StringEncoding];
     if (!body) body = [[NSString alloc] initWithData:bodyData encoding:NSISOLatin1StringEncoding] ?: @"";
 
-    NSDictionary *resultDict = @{
+    NSString *contentType = @"";
+    id ct = httpResponse.allHeaderFields[@"Content-Type"] ?: httpResponse.allHeaderFields[@"content-type"];
+    if ([ct isKindOfClass:[NSString class]]) contentType = [(NSString *)ct lowercaseString];
+
+    NSString *parseType = parse;
+    if ([parse isEqualToString:@"auto"]) {
+        NSString *trimmed = MCPTrimmedString(body);
+        if ([contentType containsString:@"application/json"] || [contentType containsString:@"+json"] || (([trimmed hasPrefix:@"{"] && [trimmed hasSuffix:@"}"]) || ([trimmed hasPrefix:@"["] && [trimmed hasSuffix:@"]"]))) parseType = @"json";
+        else if ([contentType containsString:@"text/html"] || [trimmed rangeOfString:@"<html" options:NSCaseInsensitiveSearch].location != NSNotFound || [trimmed rangeOfString:@"<!doctype html" options:NSCaseInsensitiveSearch].location != NSNotFound) parseType = @"html";
+        else parseType = @"text";
+    }
+
+    id parsed = [NSNull null];
+    id parseError = [NSNull null];
+    if ([parseType isEqualToString:@"json"]) {
+        NSError *jsonError = nil;
+        id obj = [NSJSONSerialization JSONObjectWithData:[body dataUsingEncoding:NSUTF8StringEncoding] options:0 error:&jsonError];
+        if (obj) parsed = obj;
+        else parseError = [NSString stringWithFormat:@"JSON parse failed: %@%@", jsonError.localizedDescription ?: @"Invalid JSON", truncated ? @" (response may be truncated)" : @""];
+    } else if ([parseType isEqualToString:@"html"]) {
+        parsed = MCPParseHTML(body);
+    }
+
+    NSMutableDictionary *resultDict = [@{
         @"url": urlResponse.URL.absoluteString ?: urlString,
         @"statusCode": @(httpResponse ? httpResponse.statusCode : 0),
         @"headers": httpResponse.allHeaderFields ?: @{},
+        @"contentType": contentType ?: @"",
         @"content": body ?: @"",
+        @"parse": parse,
+        @"parseType": parseType,
+        @"parsed": parsed,
+        @"parseError": parseError,
         @"truncated": @(truncated)
-    };
+    } mutableCopy];
     NSData *jsonData = [NSJSONSerialization dataWithJSONObject:resultDict options:0 error:nil];
     NSString *jsonStr = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
     return [self mcpSuccess:reqId text:jsonStr isError:(httpResponse && httpResponse.statusCode >= 400)];
