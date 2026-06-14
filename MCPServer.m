@@ -132,7 +132,7 @@ static NSString *MCPFileTypeFromAttributes(NSDictionary *attrs, BOOL isDir) {
     NSString *type = attrs[NSFileType];
     if ([type isEqualToString:NSFileTypeSymbolicLink]) return @"symlink";
     if ([type isEqualToString:NSFileTypeSocket]) return @"socket";
-    if ([type isEqualToString:NSFileTypeFifo]) return @"fifo";
+    if ([type isEqualToString:@"NSFileTypeFifo"]) return @"fifo";
     if ([type isEqualToString:NSFileTypeCharacterSpecial] || [type isEqualToString:NSFileTypeBlockSpecial]) return @"device";
     if (isDir) return @"directory";
     if ([type isEqualToString:NSFileTypeRegular]) return @"file";
