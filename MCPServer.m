@@ -122,6 +122,53 @@ static NSString *MCPRelativePath(NSString *path, NSString *base) {
     return relative.length > 0 ? relative : @".";
 }
 
+
+static NSString *MCPJSONString(NSDictionary *dict) {
+    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:dict options:0 error:nil];
+    return [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding] ?: @"{}";
+}
+
+static NSString *MCPFileTypeFromAttributes(NSDictionary *attrs, BOOL isDir) {
+    NSString *type = attrs[NSFileType];
+    if ([type isEqualToString:NSFileTypeSymbolicLink]) return @"symlink";
+    if ([type isEqualToString:NSFileTypeSocket]) return @"socket";
+    if ([type isEqualToString:NSFileTypeFifo]) return @"fifo";
+    if ([type isEqualToString:NSFileTypeCharacterSpecial] || [type isEqualToString:NSFileTypeBlockSpecial]) return @"device";
+    if (isDir) return @"directory";
+    if ([type isEqualToString:NSFileTypeRegular]) return @"file";
+    return @"unsupported";
+}
+
+static BOOL MCPDataLooksBinary(NSData *data) {
+    if (!data.length) return NO;
+    const uint8_t *bytes = data.bytes;
+    NSUInteger limit = MIN(data.length, (NSUInteger)8192);
+    for (NSUInteger i = 0; i < limit; i++) {
+        if (bytes[i] == 0) return YES;
+    }
+    return NO;
+}
+
+static BOOL MCPSearchShouldSkipDirectory(NSString *name) {
+    static NSSet *skip = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        skip = [NSSet setWithArray:@[@".git", @"node_modules", @"Pods", @"build", @"DerivedData", @"dist", @".cache"]];
+    });
+    return [skip containsObject:name];
+}
+
+static BOOL MCPSearchShouldSkipExtension(NSString *path) {
+    NSString *ext = path.pathExtension.lowercaseString;
+    if (!ext.length) return NO;
+    static NSSet *skip = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        skip = [NSSet setWithArray:@[@"png", @"jpg", @"jpeg", @"gif", @"webp", @"heic", @"pdf", @"zip", @"gz", @"tgz", @"xz", @"7z", @"dylib", @"a", @"o", @"so", @"sqlite", @"db", @"car", @"ttf", @"otf", @"mp3", @"mp4", @"mov"]];
+    });
+    return [skip containsObject:ext];
+}
+
 static NSString *MCPBasePath(NSString *path) {
     if (!path.length) return @"";
     NSRange query = [path rangeOfString:@"?"];
@@ -825,7 +872,8 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
                     @"path": @{@"type": @"string", @"description": @"Directory path (default: current directory)"},
                     @"recursive": @{@"type": @"boolean", @"description": @"List recursively (default: false)"},
                     @"max_depth": @{@"type": @"integer", @"description": @"Maximum recursion depth (default: 2)"},
-                    @"include_hidden": @{@"type": @"boolean", @"description": @"Include hidden files (default: false)"}
+                    @"include_hidden": @{@"type": @"boolean", @"description": @"Include hidden files (default: false)"},
+                    @"max_entries": @{@"type": @"integer", @"description": @"Maximum entries to return (default: 3000, max: 10000)"}
                 }
             }
         },
@@ -855,7 +903,7 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
                     @"case_sensitive": @{@"type": @"boolean", @"description": @"Case-sensitive search (default: true)"},
                     @"max_results": @{@"type": @"integer", @"description": @"Maximum matches to return (default: 200)"}
                 },
-                @"required": @[@"query"]
+                @"required": @[@"path", @"query"]
             }
         },
         @{
@@ -972,22 +1020,31 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
     if (!MCPBoolFromArgs(args, @"include_hidden", NO, &includeHidden, &paramError)) return [self mcpError:reqId code:-32602 message:paramError];
     NSInteger maxDepth = MCPIntegerFromArgs(args, @"max_depth", 2);
     if (maxDepth < 0) maxDepth = 0;
+    if (maxDepth > 8) maxDepth = 8;
+    NSInteger maxEntries = MCPIntegerFromArgs(args, @"max_entries", 3000);
+    if (maxEntries <= 0) maxEntries = 3000;
+    if (maxEntries > 10000) maxEntries = 10000;
 
     NSString *root = MCPResolvedToolPath(path ?: @".");
     NSFileManager *fm = [NSFileManager defaultManager];
     BOOL isDir = NO;
-    if (![fm fileExistsAtPath:root isDirectory:&isDir] || !isDir) {
-        return [self mcpSuccess:reqId text:[NSString stringWithFormat:@"Path is not a directory: %@", root] isError:YES];
+    if (![fm fileExistsAtPath:root isDirectory:&isDir]) {
+        return [self mcpSuccess:reqId text:MCPJSONString(@{@"error": @"path_not_found", @"path": root}) isError:YES];
+    }
+    if (!isDir) {
+        return [self mcpSuccess:reqId text:MCPJSONString(@{@"error": @"not_directory", @"path": root}) isError:YES];
     }
 
     NSMutableArray *entries = [NSMutableArray array];
+    __block BOOL truncated = NO;
     void (^addEntry)(NSString *, NSInteger) = ^(NSString *entryPath, NSInteger depth) {
+        if (entries.count >= (NSUInteger)maxEntries) { truncated = YES; return; }
         BOOL entryIsDir = NO;
         [fm fileExistsAtPath:entryPath isDirectory:&entryIsDir];
         NSDictionary *attrs = [fm attributesOfItemAtPath:entryPath error:nil] ?: @{};
         [entries addObject:@{
             @"path": MCPRelativePath(entryPath, root),
-            @"type": entryIsDir ? @"directory" : @"file",
+            @"type": MCPFileTypeFromAttributes(attrs, entryIsDir),
             @"size": attrs[NSFileSize] ?: @0,
             @"depth": @(depth)
         }];
@@ -995,6 +1052,7 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
 
     if (recursive) {
         NSDirectoryEnumerator *enumerator = [fm enumeratorAtPath:root];
+        NSMutableArray *relativePaths = [NSMutableArray array];
         for (NSString *relative in enumerator) {
             if (!includeHidden && [relative.lastPathComponent hasPrefix:@"."]) {
                 [enumerator skipDescendants];
@@ -1005,21 +1063,36 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
                 [enumerator skipDescendants];
                 continue;
             }
-            NSString *child = [root stringByAppendingPathComponent:relative];
-            addEntry(child, depth);
+            [relativePaths addObject:relative];
+            if (relativePaths.count > (NSUInteger)maxEntries) truncated = YES;
+        }
+        [relativePaths sortUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+        for (NSString *relative in relativePaths) {
+            addEntry([root stringByAppendingPathComponent:relative], [[relative pathComponents] count] - 1);
+            if (entries.count >= (NSUInteger)maxEntries) { truncated = YES; break; }
         }
     } else {
-        NSArray *children = [[fm contentsOfDirectoryAtPath:root error:nil] sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+        NSArray *children = [fm contentsOfDirectoryAtPath:root error:nil];
+        if (!children) {
+            return [self mcpSuccess:reqId text:MCPJSONString(@{@"error": @"permission_denied_or_unreadable", @"path": root}) isError:YES];
+        }
+        NSMutableArray *dirs = [NSMutableArray array];
+        NSMutableArray *files = [NSMutableArray array];
         for (NSString *name in children) {
             if (!includeHidden && [name hasPrefix:@"."]) continue;
-            addEntry([root stringByAppendingPathComponent:name], 0);
+            BOOL childIsDir = NO;
+            NSString *child = [root stringByAppendingPathComponent:name];
+            [fm fileExistsAtPath:child isDirectory:&childIsDir];
+            [(childIsDir ? dirs : files) addObject:name];
         }
+        [dirs sortUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+        [files sortUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+        for (NSString *name in [dirs arrayByAddingObjectsFromArray:files]) addEntry([root stringByAppendingPathComponent:name], 0);
     }
 
-    NSDictionary *result = @{@"path": root, @"entries": entries};
-    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:result options:0 error:nil];
-    return [self mcpSuccess:reqId text:[[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding]];
+    return [self mcpSuccess:reqId text:MCPJSONString(@{@"path": root, @"entries": entries, @"truncated": @(truncated), @"max_entries": @(maxEntries)})];
 }
+
 
 - (NSDictionary *)executeReadFile:(id)reqId args:(NSDictionary *)args {
     NSString *path = nil;
@@ -1030,36 +1103,72 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
     if (maxBytes <= 0) maxBytes = 200000;
     if (maxBytes > 1024 * 1024) maxBytes = 1024 * 1024;
 
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL isDir = NO;
+    if (![fm fileExistsAtPath:resolved isDirectory:&isDir]) {
+        return [self mcpSuccess:reqId text:MCPJSONString(@{@"error": @"path_not_found", @"path": resolved}) isError:YES];
+    }
+    if (isDir) {
+        return [self mcpSuccess:reqId text:MCPJSONString(@{@"error": @"is_directory", @"path": resolved}) isError:YES];
+    }
+
     NSData *data = [NSData dataWithContentsOfFile:resolved];
-    if (!data) return [self mcpSuccess:reqId text:[NSString stringWithFormat:@"Failed to read file: %@", resolved] isError:YES];
+    if (!data) return [self mcpSuccess:reqId text:MCPJSONString(@{@"error": @"read_failed", @"path": resolved}) isError:YES];
+    if (MCPDataLooksBinary(data)) {
+        return [self mcpSuccess:reqId text:MCPJSONString(@{@"error": @"not_utf8_text", @"path": resolved}) isError:YES];
+    }
+
     BOOL truncated = NO;
     if (data.length > (NSUInteger)maxBytes) {
         data = [data subdataWithRange:NSMakeRange(0, (NSUInteger)maxBytes)];
         truncated = YES;
     }
     NSString *content = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-    if (!content) return [self mcpSuccess:reqId text:@"File is not valid UTF-8 text" isError:YES];
+    if (!content) {
+        return [self mcpSuccess:reqId text:MCPJSONString(@{@"error": @"decode_failed", @"encoding": @"utf-8", @"path": resolved}) isError:YES];
+    }
 
     NSInteger startLine = MCPIntegerFromArgs(args, @"start_line", 0);
     NSInteger endLine = MCPIntegerFromArgs(args, @"end_line", 0);
+    NSInteger actualStart = 1;
+    NSInteger actualEnd = 0;
+    NSString *warning = nil;
+    NSArray *lines = [content componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+    NSInteger totalLines = content.length ? (NSInteger)lines.count : 0;
+
     if (startLine > 0 || endLine > 0) {
-        NSArray *lines = [content componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
-        if (startLine <= 0) startLine = 1;
-        if (endLine <= 0 || endLine > (NSInteger)lines.count) endLine = lines.count;
-        if (startLine > endLine) content = @"";
-        else content = [[lines subarrayWithRange:NSMakeRange((NSUInteger)startLine - 1, (NSUInteger)(endLine - startLine + 1))] componentsJoinedByString:@"\n"];
+        actualStart = startLine > 0 ? startLine : 1;
+        actualEnd = endLine > 0 ? endLine : totalLines;
+        if (actualStart > totalLines || actualStart > actualEnd) {
+            content = @"";
+            warning = @"range_out_of_file";
+        } else {
+            if (actualEnd > totalLines) { actualEnd = totalLines; warning = @"range_clamped"; }
+            content = [[lines subarrayWithRange:NSMakeRange((NSUInteger)actualStart - 1, (NSUInteger)(actualEnd - actualStart + 1))] componentsJoinedByString:@"\n"];
+        }
+    } else {
+        actualEnd = totalLines;
     }
 
-    NSDictionary *result = @{@"path": resolved, @"content": content ?: @"", @"truncated": @(truncated)};
-    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:result options:0 error:nil];
-    return [self mcpSuccess:reqId text:[[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding]];
+    NSMutableDictionary *result = [@{
+        @"path": resolved,
+        @"content": content ?: @"",
+        @"truncated": @(truncated),
+        @"max_bytes": @(maxBytes),
+        @"total_lines": @(totalLines),
+        @"start_line": @(actualStart),
+        @"end_line": @(actualEnd)
+    } mutableCopy];
+    if (warning) result[@"warning"] = warning;
+    return [self mcpSuccess:reqId text:MCPJSONString(result)];
 }
+
 
 - (NSDictionary *)executeSearchFiles:(id)reqId args:(NSDictionary *)args {
     NSString *path = nil;
     NSString *query = nil;
     NSString *paramError = nil;
-    if (!MCPStringFromArgs(args, @"path", NO, &path, &paramError)) return [self mcpError:reqId code:-32602 message:paramError];
+    if (!MCPStringFromArgs(args, @"path", YES, &path, &paramError)) return [self mcpError:reqId code:-32602 message:paramError];
     if (!MCPStringFromArgs(args, @"query", YES, &query, &paramError)) return [self mcpError:reqId code:-32602 message:paramError];
     BOOL regex = NO;
     if (!MCPBoolFromArgs(args, @"regex", NO, &regex, &paramError)) return [self mcpError:reqId code:-32602 message:paramError];
@@ -1069,25 +1178,42 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
     if (maxResults <= 0) maxResults = 200;
     if (maxResults > 2000) maxResults = 2000;
 
-    NSString *root = MCPResolvedToolPath(path ?: @".");
+    NSString *root = MCPResolvedToolPath(path);
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSDirectoryEnumerator *enumerator = [fm enumeratorAtPath:root];
-    NSMutableArray *matches = [NSMutableArray array];
-    NSRegularExpression *expression = nil;
-    if (regex) {
-        expression = [NSRegularExpression regularExpressionWithPattern:query options:(caseSensitive ? 0 : NSRegularExpressionCaseInsensitive) error:nil];
-        if (!expression) return [self mcpError:reqId code:-32602 message:@"Invalid regular expression"];
+    BOOL isDir = NO;
+    if (![fm fileExistsAtPath:root isDirectory:&isDir]) {
+        return [self mcpSuccess:reqId text:MCPJSONString(@{@"error": @"path_not_found", @"path": root}) isError:YES];
+    }
+    if (!isDir) {
+        return [self mcpSuccess:reqId text:MCPJSONString(@{@"error": @"not_directory", @"path": root}) isError:YES];
     }
 
+    NSRegularExpression *expression = nil;
+    if (regex) {
+        NSError *regexError = nil;
+        expression = [NSRegularExpression regularExpressionWithPattern:query options:(caseSensitive ? 0 : NSRegularExpressionCaseInsensitive) error:&regexError];
+        if (!expression) {
+            return [self mcpError:reqId code:-32602 message:[NSString stringWithFormat:@"Invalid regular expression: %@", regexError.localizedDescription ?: @""]];
+        }
+    }
+
+    NSDirectoryEnumerator *enumerator = [fm enumeratorAtPath:root];
+    NSMutableArray *matches = [NSMutableArray array];
+    BOOL truncated = NO;
     for (NSString *relative in enumerator) {
-        if (matches.count >= (NSUInteger)maxResults) break;
-        if ([relative.lastPathComponent hasPrefix:@"."]) continue;
+        if (matches.count >= (NSUInteger)maxResults) { truncated = YES; break; }
+        NSString *name = relative.lastPathComponent;
+        if ([name hasPrefix:@"."]) { [enumerator skipDescendants]; continue; }
+        if (MCPSearchShouldSkipDirectory(name)) { [enumerator skipDescendants]; continue; }
         NSString *filePath = [root stringByAppendingPathComponent:relative];
-        BOOL isDir = NO;
-        [fm fileExistsAtPath:filePath isDirectory:&isDir];
-        if (isDir) continue;
+        BOOL entryIsDir = NO;
+        [fm fileExistsAtPath:filePath isDirectory:&entryIsDir];
+        if (entryIsDir) continue;
+        if (MCPSearchShouldSkipExtension(filePath)) continue;
+        NSDictionary *attrs = [fm attributesOfItemAtPath:filePath error:nil] ?: @{};
+        if (![MCPFileTypeFromAttributes(attrs, entryIsDir) isEqualToString:@"file"]) continue;
         NSData *data = [NSData dataWithContentsOfFile:filePath options:0 error:nil];
-        if (!data || data.length > 1024 * 1024) continue;
+        if (!data || data.length > 1024 * 1024 || MCPDataLooksBinary(data)) continue;
         NSString *content = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
         if (!content) continue;
         NSArray *lines = [content componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
@@ -1107,10 +1233,17 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
         }
     }
 
-    NSDictionary *result = @{@"path": root, @"query": query, @"matches": matches, @"truncated": @(matches.count >= (NSUInteger)maxResults)};
-    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:result options:0 error:nil];
-    return [self mcpSuccess:reqId text:[[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding]];
+    return [self mcpSuccess:reqId text:MCPJSONString(@{
+        @"path": root,
+        @"query": query,
+        @"matches": matches,
+        @"truncated": @(truncated || matches.count >= (NSUInteger)maxResults),
+        @"max_results": @(maxResults),
+        @"regex": @(regex),
+        @"case_sensitive": @(caseSensitive)
+    })];
 }
+
 
 #pragma mark - Device Info Execution
 
