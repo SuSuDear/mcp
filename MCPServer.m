@@ -10,7 +10,10 @@
 #import <stdlib.h>
 #import <sys/utsname.h>
 #import <sys/statvfs.h>
+#import <sys/stat.h>
 #import <sys/wait.h>
+#import <stdio.h>
+#import <limits.h>
 #import <mach/mach.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -18,7 +21,7 @@
 
 #define MCP_PROTOCOL_VERSION @"2025-03-26"
 #define MCP_SERVER_NAME      @"com.susu.mcp"
-#define MCP_SERVER_VERSION   @"1.1.1"
+#define MCP_SERVER_VERSION   @"1.1.2"
 #define HTTP_BUF_SIZE        (256 * 1024)
 #define MCP_MAX_CHUNK_LINE   (8 * 1024)
 #define MCP_LOG(fmt, ...)    NSLog(@"[susu][mcp] " fmt, ##__VA_ARGS__)
@@ -128,6 +131,20 @@ static NSString *MCPJSONString(NSDictionary *dict) {
     return [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding] ?: @"{}";
 }
 
+static NSString *MCPFileTypeFromMode(mode_t mode) {
+    if (S_ISDIR(mode)) return @"directory";
+    if (S_ISLNK(mode)) return @"symlink";
+    if (S_ISREG(mode)) return @"file";
+    if (S_ISFIFO(mode)) return @"fifo";
+    if (S_ISSOCK(mode)) return @"socket";
+    if (S_ISCHR(mode) || S_ISBLK(mode)) return @"device";
+    return @"unsupported";
+}
+
+static NSString *MCPModeOctal(mode_t mode) {
+    return [NSString stringWithFormat:@"%03o", (unsigned)(mode & 07777)];
+}
+
 static NSString *MCPFileTypeFromAttributes(NSDictionary *attrs, BOOL isDir) {
     NSString *type = attrs[NSFileType];
     if ([type isEqualToString:NSFileTypeSymbolicLink]) return @"symlink";
@@ -139,6 +156,42 @@ static NSString *MCPFileTypeFromAttributes(NSDictionary *attrs, BOOL isDir) {
     return @"unsupported";
 }
 
+static NSMutableDictionary *MCPFileEntryForPath(NSString *entryPath, NSString *root, NSInteger depth) {
+    NSString *relative = MCPRelativePath(entryPath, root);
+    NSMutableDictionary *entry = [@{
+        @"path": relative,
+        @"name": entryPath.lastPathComponent ?: relative,
+        @"depth": @(depth)
+    } mutableCopy];
+
+    struct stat st;
+    if (lstat(entryPath.fileSystemRepresentation, &st) == 0) {
+        entry[@"type"] = MCPFileTypeFromMode(st.st_mode);
+        entry[@"size"] = @(st.st_size);
+        entry[@"mode"] = MCPModeOctal(st.st_mode);
+#if defined(__APPLE__)
+        entry[@"mtime"] = @((long long)st.st_mtimespec.tv_sec);
+#else
+        entry[@"mtime"] = @((long long)st.st_mtime);
+#endif
+        if (S_ISLNK(st.st_mode)) {
+            char buf[PATH_MAX];
+            ssize_t n = readlink(entryPath.fileSystemRepresentation, buf, sizeof(buf) - 1);
+            if (n > 0) {
+                buf[n] = '\0';
+                entry[@"symlink_target"] = [NSString stringWithUTF8String:buf] ?: @"";
+            }
+        }
+    } else {
+        BOOL entryIsDir = NO;
+        [[NSFileManager defaultManager] fileExistsAtPath:entryPath isDirectory:&entryIsDir];
+        NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:entryPath error:nil] ?: @{};
+        entry[@"type"] = MCPFileTypeFromAttributes(attrs, entryIsDir);
+        entry[@"size"] = attrs[NSFileSize] ?: @0;
+    }
+    return entry;
+}
+
 static BOOL MCPDataLooksBinary(NSData *data) {
     if (!data.length) return NO;
     const uint8_t *bytes = data.bytes;
@@ -147,6 +200,24 @@ static BOOL MCPDataLooksBinary(NSData *data) {
         if (bytes[i] == 0) return YES;
     }
     return NO;
+}
+
+static NSString *MCPUTF8StringFromDataTrimmingTail(NSData *data) {
+    if (!data) return nil;
+    NSString *content = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    if (content || data.length == 0) return content ?: @"";
+    NSUInteger trimLimit = MIN((NSUInteger)4, data.length);
+    for (NSUInteger trim = 1; trim <= trimLimit; trim++) {
+        NSData *trimmed = [data subdataWithRange:NSMakeRange(0, data.length - trim)];
+        content = [[NSString alloc] initWithData:trimmed encoding:NSUTF8StringEncoding];
+        if (content) return content;
+    }
+    return nil;
+}
+
+static NSInteger MCPCalculateLineCount(NSString *content) {
+    if (!content.length) return 0;
+    return (NSInteger)[content componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]].count;
 }
 
 static BOOL MCPSearchShouldSkipDirectory(NSString *name) {
@@ -854,7 +925,7 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
                 @"name": MCP_SERVER_NAME,
                 @"version": MCP_SERVER_VERSION
             },
-            @"instructions": @"Use com.susu.mcp to inspect files on the connected iPhone and run shell commands.\n\nFiles: list_files lists directory contents, read_file reads text files, and search_files searches file contents.\n\nDevice info: get_device_info for model, iOS version, battery, storage, memory, and jailbreak type/package information.\n\nShell: run_command executes shell commands on the device (timeout default 10s, max 30s).\n\nWeb: fetch_url fetches HTTP/HTTPS URL content.\n\nProject skills: read_project_skill reads skill.md or SKILL.md from a project root before project work.\n\nHealth checks: avoid shell brace expansion such as for i in {1..30}; use seq or a while loop, and set request timeouts for /health."
+            @"instructions": @"Use com.susu.mcp to inspect files on the connected iPhone and run shell commands.\n\nFiles: list_files lists directory contents with metadata, read_file reads text or binary files and supports line ranges for text, and search_files searches file contents.\n\nDevice info: get_device_info for model, iOS version, battery, storage, memory, and jailbreak type/package information.\n\nShell: run_command executes shell commands on the device (timeout default 10s, max 30s).\n\nWeb: fetch_url fetches HTTP/HTTPS URL content.\n\nProject skills: read_project_skill reads skill.md or SKILL.md from a project root before project work.\n\nHealth checks: avoid shell brace expansion such as for i in {1..30}; use seq or a while loop, and set request timeouts for /health."
         }
     };
 }
@@ -865,7 +936,7 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
     NSArray *tools = @[
         @{
             @"name": @"list_files",
-            @"description": @"List files and directories under a path",
+            @"description": @"List files and directories under a path. Entries include path/name/type/size/depth plus mode/mtime and symlink_target when available.",
             @"inputSchema": @{
                 @"type": @"object",
                 @"properties": @{
@@ -879,14 +950,15 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
         },
         @{
             @"name": @"read_file",
-            @"description": @"Read a UTF-8 text file, optionally by line range",
+            @"description": @"Read a file. Text files support optional 1-based line ranges; binary=true forces base64 output. Non-UTF-8 content returns base64. Output is capped by max_bytes.",
             @"inputSchema": @{
                 @"type": @"object",
                 @"properties": @{
                     @"path": @{@"type": @"string", @"description": @"File path to read"},
-                    @"start_line": @{@"type": @"integer", @"description": @"1-based start line"},
-                    @"end_line": @{@"type": @"integer", @"description": @"1-based end line"},
-                    @"max_bytes": @{@"type": @"integer", @"description": @"Maximum bytes to return (default: 200000)"}
+                    @"start_line": @{@"type": @"integer", @"description": @"1-based start line for text mode"},
+                    @"end_line": @{@"type": @"integer", @"description": @"1-based end line for text mode"},
+                    @"max_bytes": @{@"type": @"integer", @"description": @"Maximum bytes to return (default: 200000, max: 4194304)"},
+                    @"binary": @{@"type": @"boolean", @"description": @"Force base64 output (default: false)"}
                 },
                 @"required": @[@"path"]
             }
@@ -1039,15 +1111,7 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
     __block BOOL truncated = NO;
     void (^addEntry)(NSString *, NSInteger) = ^(NSString *entryPath, NSInteger depth) {
         if (entries.count >= (NSUInteger)maxEntries) { truncated = YES; return; }
-        BOOL entryIsDir = NO;
-        [fm fileExistsAtPath:entryPath isDirectory:&entryIsDir];
-        NSDictionary *attrs = [fm attributesOfItemAtPath:entryPath error:nil] ?: @{};
-        [entries addObject:@{
-            @"path": MCPRelativePath(entryPath, root),
-            @"type": MCPFileTypeFromAttributes(attrs, entryIsDir),
-            @"size": attrs[NSFileSize] ?: @0,
-            @"depth": @(depth)
-        }];
+        [entries addObject:MCPFileEntryForPath(entryPath, root, depth)];
     };
 
     if (recursive) {
@@ -1090,7 +1154,13 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
         for (NSString *name in [dirs arrayByAddingObjectsFromArray:files]) addEntry([root stringByAppendingPathComponent:name], 0);
     }
 
-    return [self mcpSuccess:reqId text:MCPJSONString(@{@"path": root, @"entries": entries, @"truncated": @(truncated), @"max_entries": @(maxEntries)})];
+    return [self mcpSuccess:reqId text:MCPJSONString(@{
+        @"path": root,
+        @"resolved_path": root,
+        @"entries": entries,
+        @"truncated": @(truncated),
+        @"max_entries": @(maxEntries)
+    })];
 }
 
 
@@ -1098,10 +1168,21 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
     NSString *path = nil;
     NSString *paramError = nil;
     if (!MCPStringFromArgs(args, @"path", YES, &path, &paramError)) return [self mcpError:reqId code:-32602 message:paramError];
+    BOOL binary = NO;
+    if (!MCPBoolFromArgs(args, @"binary", NO, &binary, &paramError)) return [self mcpError:reqId code:-32602 message:paramError];
     NSString *resolved = MCPResolvedToolPath(path);
     NSInteger maxBytes = MCPIntegerFromArgs(args, @"max_bytes", 200000);
     if (maxBytes <= 0) maxBytes = 200000;
-    if (maxBytes > 1024 * 1024) maxBytes = 1024 * 1024;
+    if (maxBytes > 4 * 1024 * 1024) maxBytes = 4 * 1024 * 1024;
+
+    NSInteger startLine = MCPIntegerFromArgs(args, @"start_line", 0);
+    NSInteger endLine = MCPIntegerFromArgs(args, @"end_line", 0);
+    if (startLine < 0 || endLine < 0) {
+        return [self mcpError:reqId code:-32602 message:@"start_line and end_line must be positive integers"];
+    }
+    if (startLine > 0 && endLine > 0 && startLine > endLine) {
+        return [self mcpError:reqId code:-32602 message:@"start_line must be less than or equal to end_line"];
+    }
 
     NSFileManager *fm = [NSFileManager defaultManager];
     BOOL isDir = NO;
@@ -1112,55 +1193,156 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
         return [self mcpSuccess:reqId text:MCPJSONString(@{@"error": @"is_directory", @"path": resolved}) isError:YES];
     }
 
-    NSData *data = [NSData dataWithContentsOfFile:resolved];
-    if (!data) return [self mcpSuccess:reqId text:MCPJSONString(@{@"error": @"read_failed", @"path": resolved}) isError:YES];
-    if (MCPDataLooksBinary(data)) {
-        return [self mcpSuccess:reqId text:MCPJSONString(@{@"error": @"not_utf8_text", @"path": resolved}) isError:YES];
+    NSDictionary *attrs = [fm attributesOfItemAtPath:resolved error:nil] ?: @{};
+    unsigned long long fileSize = [attrs[NSFileSize] unsignedLongLongValue];
+    NSUInteger limit = (NSUInteger)maxBytes;
+
+    BOOL hasLineRange = (startLine > 0 || endLine > 0);
+    if (binary && hasLineRange) {
+        return [self mcpError:reqId code:-32602 message:@"start_line/end_line are only supported in text mode; omit them or set binary=false"];
     }
 
-    BOOL truncated = NO;
-    if (data.length > (NSUInteger)maxBytes) {
-        data = [data subdataWithRange:NSMakeRange(0, (NSUInteger)maxBytes)];
-        truncated = YES;
-    }
-    NSString *content = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-    if (!content) {
-        return [self mcpSuccess:reqId text:MCPJSONString(@{@"error": @"decode_failed", @"encoding": @"utf-8", @"path": resolved}) isError:YES];
+    NSData *(^readPrefix)(void) = ^NSData *{
+        NSFileHandle *prefixHandle = [NSFileHandle fileHandleForReadingAtPath:resolved];
+        if (!prefixHandle) return nil;
+        NSData *data = nil;
+        @try { data = [prefixHandle readDataOfLength:limit + 1]; }
+        @catch (NSException *e) { data = nil; }
+        @try { [prefixHandle closeFile]; } @catch (NSException *e) {}
+        return data;
+    };
+
+    if (binary) {
+        NSData *data = readPrefix();
+        if (!data) return [self mcpSuccess:reqId text:MCPJSONString(@{@"error": @"read_failed", @"path": resolved}) isError:YES];
+        BOOL truncated = data.length > limit;
+        if (truncated) data = [data subdataWithRange:NSMakeRange(0, limit)];
+        return [self mcpSuccess:reqId text:MCPJSONString(@{
+            @"path": resolved,
+            @"resolved_path": resolved,
+            @"size": @(fileSize),
+            @"encoding": @"base64",
+            @"content": [data base64EncodedStringWithOptions:0] ?: @"",
+            @"truncated": @(truncated),
+            @"max_bytes": @(maxBytes),
+            @"hint": truncated ? @"Output truncated; increase max_bytes up to 4194304 or use run_command/download alternatives for the full file." : @""
+        })];
     }
 
-    NSInteger startLine = MCPIntegerFromArgs(args, @"start_line", 0);
-    NSInteger endLine = MCPIntegerFromArgs(args, @"end_line", 0);
-    NSInteger actualStart = 1;
-    NSInteger actualEnd = 0;
-    NSString *warning = nil;
-    NSArray *lines = [content componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
-    NSInteger totalLines = content.length ? (NSInteger)lines.count : 0;
+    NSFileHandle *probeHandle = [NSFileHandle fileHandleForReadingAtPath:resolved];
+    if (!probeHandle) return [self mcpSuccess:reqId text:MCPJSONString(@{@"error": @"read_failed", @"path": resolved}) isError:YES];
+    NSData *probe = nil;
+    @try { probe = [probeHandle readDataOfLength:8192]; }
+    @catch (NSException *e) { probe = nil; }
+    @try { [probeHandle closeFile]; } @catch (NSException *e) {}
+    if (probe && MCPDataLooksBinary(probe)) {
+        NSData *data = readPrefix();
+        if (!data) return [self mcpSuccess:reqId text:MCPJSONString(@{@"error": @"read_failed", @"path": resolved}) isError:YES];
+        BOOL truncated = data.length > limit;
+        if (truncated) data = [data subdataWithRange:NSMakeRange(0, limit)];
+        return [self mcpSuccess:reqId text:MCPJSONString(@{
+            @"path": resolved,
+            @"resolved_path": resolved,
+            @"size": @(fileSize),
+            @"encoding": @"base64",
+            @"content": [data base64EncodedStringWithOptions:0] ?: @"",
+            @"truncated": @(truncated),
+            @"max_bytes": @(maxBytes),
+            @"hint": truncated ? @"Binary output truncated; increase max_bytes up to 4194304." : @""
+        })];
+    }
 
-    if (startLine > 0 || endLine > 0) {
-        actualStart = startLine > 0 ? startLine : 1;
-        actualEnd = endLine > 0 ? endLine : totalLines;
-        if (actualStart > totalLines || actualStart > actualEnd) {
-            content = @"";
-            warning = @"range_out_of_file";
-        } else {
-            if (actualEnd > totalLines) { actualEnd = totalLines; warning = @"range_clamped"; }
-            content = [[lines subarrayWithRange:NSMakeRange((NSUInteger)actualStart - 1, (NSUInteger)(actualEnd - actualStart + 1))] componentsJoinedByString:@"\n"];
+    if (hasLineRange) {
+        NSInteger actualStart = startLine > 0 ? startLine : 1;
+        NSInteger requestedEnd = endLine > 0 ? endLine : LONG_MAX;
+        NSMutableData *selected = [NSMutableData data];
+        BOOL truncated = NO;
+        NSInteger totalLines = 0;
+        NSInteger lastCapturedLine = 0;
+
+        FILE *fp = fopen(resolved.fileSystemRepresentation, "rb");
+        if (!fp) return [self mcpSuccess:reqId text:MCPJSONString(@{@"error": @"read_failed", @"path": resolved}) isError:YES];
+        char *line = NULL;
+        size_t cap = 0;
+        ssize_t n = 0;
+        while ((n = getline(&line, &cap, fp)) != -1) {
+            totalLines++;
+            if (totalLines >= actualStart && totalLines <= requestedEnd) {
+                if (!truncated) {
+                    NSUInteger available = limit > selected.length ? limit - selected.length : 0;
+                    if ((NSUInteger)n <= available) {
+                        [selected appendBytes:line length:(NSUInteger)n];
+                        lastCapturedLine = totalLines;
+                    } else {
+                        if (available > 0) [selected appendBytes:line length:available];
+                        truncated = YES;
+                        lastCapturedLine = totalLines;
+                    }
+                }
+            }
         }
-    } else {
-        actualEnd = totalLines;
+        if (line) free(line);
+        fclose(fp);
+
+        NSString *warning = nil;
+        if (actualStart > totalLines) warning = @"range_out_of_file";
+        NSInteger actualEnd = endLine > 0 ? MIN(endLine, totalLines) : totalLines;
+        if (!warning && endLine > 0 && endLine > totalLines) warning = @"range_clamped";
+        if (truncated) warning = warning ?: @"output_truncated";
+
+        NSString *content = MCPUTF8StringFromDataTrimmingTail(selected);
+        if (!content) {
+            return [self mcpSuccess:reqId text:MCPJSONString(@{@"error": @"decode_failed", @"encoding": @"utf-8", @"path": resolved}) isError:YES];
+        }
+        NSMutableDictionary *result = [@{
+            @"path": resolved,
+            @"resolved_path": resolved,
+            @"size": @(fileSize),
+            @"encoding": @"utf8",
+            @"content": content ?: @"",
+            @"truncated": @(truncated),
+            @"max_bytes": @(maxBytes),
+            @"total_lines": @(totalLines),
+            @"start_line": @(actualStart),
+            @"end_line": @(actualEnd),
+            @"last_captured_line": @(lastCapturedLine)
+        } mutableCopy];
+        if (warning) result[@"warning"] = warning;
+        return [self mcpSuccess:reqId text:MCPJSONString(result)];
     }
 
-    NSMutableDictionary *result = [@{
+    NSData *data = readPrefix();
+    if (!data) return [self mcpSuccess:reqId text:MCPJSONString(@{@"error": @"read_failed", @"path": resolved}) isError:YES];
+    BOOL truncated = data.length > limit;
+    if (truncated) data = [data subdataWithRange:NSMakeRange(0, limit)];
+
+    NSString *content = MCPUTF8StringFromDataTrimmingTail(data);
+    if (!content) {
+        return [self mcpSuccess:reqId text:MCPJSONString(@{
+            @"path": resolved,
+            @"resolved_path": resolved,
+            @"size": @(fileSize),
+            @"encoding": @"base64",
+            @"content": [data base64EncodedStringWithOptions:0] ?: @"",
+            @"truncated": @(truncated),
+            @"max_bytes": @(maxBytes),
+            @"hint": truncated ? @"Output truncated; increase max_bytes up to 4194304." : @""
+        })];
+    }
+
+    return [self mcpSuccess:reqId text:MCPJSONString(@{
         @"path": resolved,
+        @"resolved_path": resolved,
+        @"size": @(fileSize),
+        @"encoding": @"utf8",
         @"content": content ?: @"",
         @"truncated": @(truncated),
         @"max_bytes": @(maxBytes),
-        @"total_lines": @(totalLines),
-        @"start_line": @(actualStart),
-        @"end_line": @(actualEnd)
-    } mutableCopy];
-    if (warning) result[@"warning"] = warning;
-    return [self mcpSuccess:reqId text:MCPJSONString(result)];
+        @"total_lines": @(MCPCalculateLineCount(content)),
+        @"start_line": @1,
+        @"end_line": @(MCPCalculateLineCount(content)),
+        @"hint": truncated ? @"Output truncated; use start_line/end_line to read later text ranges or increase max_bytes up to 4194304." : @""
+    })];
 }
 
 
