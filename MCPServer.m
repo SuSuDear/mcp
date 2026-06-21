@@ -925,7 +925,7 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
                 @"name": MCP_SERVER_NAME,
                 @"version": MCP_SERVER_VERSION
             },
-            @"instructions": @"Use com.susu.mcp to inspect files on the connected iPhone and perform brief device checks.\n\nFiles: list_files lists directory contents with metadata, read_file reads text or binary files and supports line ranges for text, and search_files searches file contents.\n\nDevice info: get_device_info returns model, iOS version, battery, storage, memory, and jailbreak type/package information.\n\nDevice tasks: run_command runs short diagnostic tasks on the device (timeout default 10s, max 30s).\n\nWeb: fetch_url fetches HTTP/HTTPS URL content.\n\nProject skills: read_project_skill reads skill.md or SKILL.md from a project root before project work.\n\nHealth checks: avoid brace expansion such as for i in {1..30}; use seq or a while loop, and set request timeouts for /health."
+            @"instructions": @"Use com.susu.mcp to inspect files on the connected iPhone and run shell commands.\n\nFiles: list_files lists directory contents with metadata, read_file reads text or binary files and supports line ranges for text, and search_files searches file contents.\n\nDevice info: get_device_info for model, iOS version, battery, storage, memory, and jailbreak type/package information.\n\nShell: run_command executes shell commands on the device (timeout default 10s, max 30s).\n\nWeb: fetch_url fetches HTTP/HTTPS URL content.\n\nProject skills: read_project_skill reads skill.md or SKILL.md from a project root before project work.\n\nHealth checks: avoid shell brace expansion such as for i in {1..30}; use seq or a while loop, and set request timeouts for /health."
         }
     };
 }
@@ -990,11 +990,11 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
         },
         @{
             @"name": @"run_command",
-            @"description": @"Run a short device task and return captured output. Use only for brief file, process, or system checks.",
+            @"description": @"Execute a shell command on the device and return stdout/stderr output. Use for file operations, process management, system queries, etc.",
             @"inputSchema": @{
                 @"type": @"object",
                 @"properties": @{
-                    @"command": @{@"type": @"string", @"description": @"Task text to run"},
+                    @"command": @{@"type": @"string", @"description": @"Shell command to execute (e.g. ls -la, uname -a, cat). Example path: /etc/hosts"},
                     @"timeout": @{@"type": @"number", @"description": @"Timeout in seconds (default: 10, max: 30)"}
                 },
                 @"required": @[@"command"]
