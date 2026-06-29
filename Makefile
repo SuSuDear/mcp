@@ -1,5 +1,6 @@
 # Rootful: iOS 13.0+, Rootless: iOS 15.0+, Roothide: iOS 15.0+
 ARCHS = arm64 arm64e
+FINALPACKAGE = 1
 ifeq ($(THEOS_PACKAGE_SCHEME),rootless)
     TARGET := iphone:clang:latest:15.0
 else ifeq ($(THEOS_PACKAGE_SCHEME),roothide)
