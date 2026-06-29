@@ -19,9 +19,10 @@
 #import <objc/message.h>
 #import <dlfcn.h>
 
-#define MCP_PROTOCOL_VERSION @"2025-03-26"
-#define MCP_SERVER_NAME      @"com.susu.mcp"
-#define MCP_SERVER_VERSION   @"1.1.2"
+#define MCP_PROTOCOL_VERSION_LATEST @"2025-11-25"
+#define MCP_PROTOCOL_VERSION_LEGACY @"2025-03-26"
+#define MCP_SERVER_NAME             @"com.susu.mcp"
+#define MCP_SERVER_VERSION          @"1.1.2"
 #define HTTP_BUF_SIZE        (256 * 1024)
 #define MCP_MAX_CHUNK_LINE   (8 * 1024)
 #define MCP_LOG(fmt, ...)    NSLog(@"[susu][mcp] " fmt, ##__VA_ARGS__)
@@ -245,6 +246,33 @@ static NSString *MCPBasePath(NSString *path) {
     NSRange query = [path rangeOfString:@"?"];
     if (query.location == NSNotFound) return path;
     return [path substringToIndex:query.location];
+}
+
+static NSArray<NSString *> *MCPSupportedProtocolVersions(void) {
+    static NSArray<NSString *> *versions = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        versions = @[
+            MCP_PROTOCOL_VERSION_LATEST,
+            @"2025-06-18",
+            MCP_PROTOCOL_VERSION_LEGACY
+        ];
+    });
+    return versions;
+}
+
+static BOOL MCPSupportsProtocolVersion(NSString *version) {
+    if (![version isKindOfClass:[NSString class]] || version.length == 0) {
+        return NO;
+    }
+    return [MCPSupportedProtocolVersions() containsObject:version];
+}
+
+static NSString *MCPNegotiateProtocolVersion(NSString *clientVersion) {
+    if (MCPSupportsProtocolVersion(clientVersion)) {
+        return clientVersion;
+    }
+    return MCP_PROTOCOL_VERSION_LATEST;
 }
 
 static BOOL MCPWriteAllToFD(int fd, const void *bytes, size_t length) {
@@ -495,7 +523,7 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
                             errorMessage:(NSString **)errorMessage;
 - (void)handleMCPRequest:(NSData *)bodyData clientSocket:(int)clientSocket;
 - (NSDictionary *)routeMCPRequest:(NSDictionary *)request;
-- (NSDictionary *)handleInitialize:(id)reqId;
+- (NSDictionary *)handleInitialize:(id)reqId params:(NSDictionary *)params;
 - (NSDictionary *)handleToolsList:(id)reqId;
 - (NSDictionary *)handleToolsCall:(id)reqId params:(NSDictionary *)params;
 - (NSDictionary *)executeListFiles:(id)reqId args:(NSDictionary *)args;
@@ -513,6 +541,8 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
 - (void)sendMethodNotAllowedResponse:(int)socket allowedMethods:(NSString *)allowedMethods message:(NSString *)message;
 - (void)sendEmptyResponse:(int)socket status:(int)status;
 - (void)writeAll:(int)socket data:(NSData *)data;
+- (NSString *)negotiatedProtocolVersion;
+- (void)setNegotiatedProtocolVersion:(NSString *)version;
 @end
 
 @implementation MCPServer {
@@ -520,6 +550,7 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
     dispatch_source_t _acceptSource;
     dispatch_queue_t _clientQueue;
     NSString *_sessionId;
+    NSString *_negotiatedProtocolVersion;
 }
 
 + (instancetype)sharedInstance {
@@ -537,8 +568,24 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
         _serverSocket = -1;
         _clientQueue = dispatch_queue_create("com.susu.mcp.client", DISPATCH_QUEUE_CONCURRENT);
         _sessionId = [[NSUUID UUID] UUIDString];
+        _negotiatedProtocolVersion = MCP_PROTOCOL_VERSION_LATEST;
     }
     return self;
+}
+
+- (NSString *)negotiatedProtocolVersion {
+    @synchronized (self) {
+        return _negotiatedProtocolVersion ?: MCP_PROTOCOL_VERSION_LATEST;
+    }
+}
+
+- (void)setNegotiatedProtocolVersion:(NSString *)version {
+    if (!MCPSupportsProtocolVersion(version)) {
+        return;
+    }
+    @synchronized (self) {
+        _negotiatedProtocolVersion = [version copy];
+    }
 }
 
 #pragma mark - Server Lifecycle
@@ -677,9 +724,22 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
     }
     NSString *transferEncoding = [headers[@"transfer-encoding"] lowercaseString] ?: @"";
     BOOL chunkedBody = [transferEncoding containsString:@"chunked"];
+    NSString *protocolVersionHeader = headers[@"mcp-protocol-version"];
 
     ssize_t bodyReceived = totalRead - headerEnd;
     NSString *basePath = MCPBasePath(path);
+
+    if ([basePath isEqualToString:@"/mcp"] && protocolVersionHeader.length > 0) {
+        if (!MCPSupportsProtocolVersion(protocolVersionHeader)) {
+            [self sendErrorResponse:clientSocket
+                              status:400
+                             message:[NSString stringWithFormat:@"Unsupported MCP protocol version: %@", protocolVersionHeader]];
+            free(buffer);
+            close(clientSocket);
+            return;
+        }
+        [self setNegotiatedProtocolVersion:protocolVersionHeader];
+    }
 
     // Route request
     if ([method isEqualToString:@"POST"] && [basePath isEqualToString:@"/mcp"]) {
@@ -738,7 +798,7 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
     } else if ([basePath isEqualToString:@"/mcp"]) {
         [self sendMethodNotAllowedResponse:clientSocket allowedMethods:@"POST" message:@"Method Not Allowed"];
     } else if ([method isEqualToString:@"GET"] && [basePath isEqualToString:@"/health"]) {
-        NSDictionary *health = @{@"status": @"ok", @"server": MCP_SERVER_NAME, @"version": MCP_SERVER_VERSION};
+        NSDictionary *health = @{@"status": @"ok", @"server": MCP_SERVER_NAME, @"version": MCP_SERVER_VERSION, @"protocolVersion": [self negotiatedProtocolVersion], @"supportedProtocolVersions": MCPSupportedProtocolVersions()};
         [self sendJSONResponse:clientSocket status:200 body:health];
     } else {
         [self sendErrorResponse:clientSocket status:404 message:@"Not Found"];
@@ -892,7 +952,7 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
     }
 
     if ([method isEqualToString:@"initialize"]) {
-        return [self handleInitialize:reqId];
+        return [self handleInitialize:reqId params:params];
     } else if ([method isEqualToString:@"notifications/initialized"]) {
         return nil; // notification, no response
     } else if ([method isEqualToString:@"ping"]) {
@@ -912,12 +972,16 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
 
 #pragma mark - MCP: initialize
 
-- (NSDictionary *)handleInitialize:(id)reqId {
+- (NSDictionary *)handleInitialize:(id)reqId params:(NSDictionary *)params {
+    NSString *clientProtocolVersion = [params[@"protocolVersion"] isKindOfClass:[NSString class]] ? params[@"protocolVersion"] : nil;
+    NSString *negotiatedProtocolVersion = MCPNegotiateProtocolVersion(clientProtocolVersion);
+    [self setNegotiatedProtocolVersion:negotiatedProtocolVersion];
+
     return @{
         @"jsonrpc": @"2.0",
         @"id": reqId ?: [NSNull null],
         @"result": @{
-            @"protocolVersion": MCP_PROTOCOL_VERSION,
+            @"protocolVersion": negotiatedProtocolVersion,
             @"capabilities": @{
                 @"tools": @{@"listChanged": @NO}
             },
@@ -925,7 +989,15 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
                 @"name": MCP_SERVER_NAME,
                 @"version": MCP_SERVER_VERSION
             },
-            @"instructions": @"Use com.susu.mcp to inspect files on the connected iPhone and run shell commands.\n\nFiles: list_files lists directory contents with metadata, read_file reads text or binary files and supports line ranges for text, and search_files searches file contents.\n\nDevice info: get_device_info for model, iOS version, battery, storage, memory, and jailbreak type/package information.\n\nShell: run_command executes shell commands on the device (timeout default 10s, max 30s).\n\nWeb: fetch_url fetches HTTP/HTTPS URL content.\n\nProject skills: read_project_skill reads skill.md or SKILL.md from a project root before project work.\n\nHealth checks: avoid shell brace expansion such as for i in {1..30}; use seq or a while loop, and set request timeouts for /health."
+            @"_meta": @{
+                @"protocolCompatibility": @{
+                    @"requestedVersion": clientProtocolVersion ?: @"",
+                    @"negotiatedVersion": negotiatedProtocolVersion,
+                    @"supportedVersions": MCPSupportedProtocolVersions(),
+                    @"httpHeader": @"MCP-Protocol-Version"
+                }
+            },
+            @"instructions": @"Use com.susu.mcp to inspect files on the connected iPhone and run shell commands.\n\nFiles: list_files lists directory contents with metadata, read_file reads text or binary files and supports line ranges for text, and search_files searches file contents.\n\nDevice info: get_device_info for model, iOS version, battery, storage, memory, and jailbreak type/package information.\n\nShell: run_command executes shell commands on the device (timeout default 10s, max 60s).\n\nWeb: fetch_url fetches HTTP/HTTPS URL content.\n\nProject skills: read_project_skill reads skill.md or SKILL.md from a project root before project work.\n\nHealth checks: avoid shell brace expansion such as for i in {1..30}; use seq or a while loop, and set request timeouts for /health."
         }
     };
 }
@@ -995,7 +1067,7 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
                 @"type": @"object",
                 @"properties": @{
                     @"command": @{@"type": @"string", @"description": @"Shell command to execute (e.g. ls -la, uname -a, cat). Example path: /etc/hosts"},
-                    @"timeout": @{@"type": @"number", @"description": @"Timeout in seconds (default: 10, max: 30)"}
+                    @"timeout": @{@"type": @"number", @"description": @"Timeout in seconds (default: 10, max: 60)"}
                 },
                 @"required": @[@"command"]
             }
@@ -1007,7 +1079,7 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
                 @"type": @"object",
                 @"properties": @{
                     @"url": @{@"type": @"string", @"description": @"HTTP or HTTPS URL to fetch"},
-                    @"timeout": @{@"type": @"number", @"description": @"Timeout in seconds (default: 15, max: 30)"},
+                    @"timeout": @{@"type": @"number", @"description": @"Timeout in seconds (default: 15, max: 60)"},
                     @"max_bytes": @{@"type": @"integer", @"description": @"Maximum response bytes to return (default: 200000, max: 1048576)"},
                     @"parse": @{@"type": @"string", @"description": @"Response parsing mode: auto, text, json, html, or none (default: auto)"}
                 },
@@ -1127,8 +1199,11 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
                 [enumerator skipDescendants];
                 continue;
             }
+            if (relativePaths.count >= (NSUInteger)maxEntries) {
+                truncated = YES;
+                break;
+            }
             [relativePaths addObject:relative];
-            if (relativePaths.count > (NSUInteger)maxEntries) truncated = YES;
         }
         [relativePaths sortUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
         for (NSString *relative in relativePaths) {
@@ -1225,6 +1300,7 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
             @"content": [data base64EncodedStringWithOptions:0] ?: @"",
             @"truncated": @(truncated),
             @"max_bytes": @(maxBytes),
+            @"warning": truncated ? @"output_truncated" : @"",
             @"hint": truncated ? @"Output truncated; increase max_bytes up to 4194304 or use run_command/download alternatives for the full file." : @""
         })];
     }
@@ -1248,6 +1324,7 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
             @"content": [data base64EncodedStringWithOptions:0] ?: @"",
             @"truncated": @(truncated),
             @"max_bytes": @(maxBytes),
+            @"warning": truncated ? @"output_truncated" : @"",
             @"hint": truncated ? @"Binary output truncated; increase max_bytes up to 4194304." : @""
         })];
     }
@@ -1326,6 +1403,7 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
             @"content": [data base64EncodedStringWithOptions:0] ?: @"",
             @"truncated": @(truncated),
             @"max_bytes": @(maxBytes),
+            @"warning": truncated ? @"output_truncated" : @"",
             @"hint": truncated ? @"Output truncated; increase max_bytes up to 4194304." : @""
         })];
     }
@@ -1341,6 +1419,7 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
         @"total_lines": @(MCPCalculateLineCount(content)),
         @"start_line": @1,
         @"end_line": @(MCPCalculateLineCount(content)),
+        @"warning": truncated ? @"output_truncated" : @"",
         @"hint": truncated ? @"Output truncated; use start_line/end_line to read later text ranges or increase max_bytes up to 4194304." : @""
     })];
 }
@@ -1382,8 +1461,15 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
     NSDirectoryEnumerator *enumerator = [fm enumeratorAtPath:root];
     NSMutableArray *matches = [NSMutableArray array];
     BOOL truncated = NO;
+    NSUInteger scannedEntries = 0;
+    NSUInteger skippedLargeFiles = 0;
+    NSUInteger skippedBinaryFiles = 0;
+    const NSUInteger maxScannedEntries = 10000;
+    const unsigned long long maxSearchFileBytes = 1024ULL * 1024ULL;
     for (NSString *relative in enumerator) {
         if (matches.count >= (NSUInteger)maxResults) { truncated = YES; break; }
+        scannedEntries++;
+        if (scannedEntries > maxScannedEntries) { truncated = YES; break; }
         NSString *name = relative.lastPathComponent;
         if ([name hasPrefix:@"."]) { [enumerator skipDescendants]; continue; }
         if (MCPSearchShouldSkipDirectory(name)) { [enumerator skipDescendants]; continue; }
@@ -1394,8 +1480,11 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
         if (MCPSearchShouldSkipExtension(filePath)) continue;
         NSDictionary *attrs = [fm attributesOfItemAtPath:filePath error:nil] ?: @{};
         if (![MCPFileTypeFromAttributes(attrs, entryIsDir) isEqualToString:@"file"]) continue;
+        unsigned long long fileSize = [attrs[NSFileSize] unsignedLongLongValue];
+        if (fileSize > maxSearchFileBytes) { skippedLargeFiles++; continue; }
         NSData *data = [NSData dataWithContentsOfFile:filePath options:0 error:nil];
-        if (!data || data.length > 1024 * 1024 || MCPDataLooksBinary(data)) continue;
+        if (!data) continue;
+        if (MCPDataLooksBinary(data)) { skippedBinaryFiles++; continue; }
         NSString *content = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
         if (!content) continue;
         NSArray *lines = [content componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
@@ -1422,7 +1511,11 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
         @"truncated": @(truncated || matches.count >= (NSUInteger)maxResults),
         @"max_results": @(maxResults),
         @"regex": @(regex),
-        @"case_sensitive": @(caseSensitive)
+        @"case_sensitive": @(caseSensitive),
+        @"scanned_entries": @(scannedEntries),
+        @"max_scanned_entries": @(maxScannedEntries),
+        @"skipped_large_files": @(skippedLargeFiles),
+        @"skipped_binary_files": @(skippedBinaryFiles)
     })];
 }
 
@@ -1531,7 +1624,7 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
         return [self mcpError:reqId code:-32602 message:paramError];
     }
     if (timeoutSec <= 0) timeoutSec = 10;
-    if (timeoutSec > 30) timeoutSec = 30;
+    if (timeoutSec > 60) timeoutSec = 60;
 
     NSString *shellPath = MCPResolvedJailbreakPath(@"/bin/sh");
     NSString *output = nil;
@@ -1546,7 +1639,15 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
                                   &exitCode,
                                   &runError);
 
-    if (!finished && [runError hasPrefix:@"Command timed out"]) {
+    BOOL timedOut = !finished && [runError hasPrefix:@"Command timed out"];
+    MCP_LOG(@"run_command finished=%@ timedOut=%@ exitCode=%d timeoutSec=%d outputBytes=%lu",
+            finished ? @"yes" : @"no",
+            timedOut ? @"yes" : @"no",
+            exitCode,
+            (int)timeoutSec,
+            (unsigned long)output.length);
+
+    if (timedOut) {
         return [self mcpSuccess:reqId text:runError isError:YES];
     }
 
@@ -1644,7 +1745,7 @@ static NSDictionary *MCPParseHTML(NSString *body) {
     double timeoutSec = 15;
     if (!MCPNumberFromArgs(args, @"timeout", 15, NO, &timeoutSec, &paramError)) return [self mcpError:reqId code:-32602 message:paramError];
     if (timeoutSec <= 0) timeoutSec = 15;
-    if (timeoutSec > 30) timeoutSec = 30;
+    if (timeoutSec > 60) timeoutSec = 60;
 
     NSInteger maxBytes = MCPIntegerFromArgs(args, @"max_bytes", 200000);
     if (maxBytes <= 0) maxBytes = 200000;
@@ -1828,9 +1929,10 @@ static NSDictionary *MCPParseHTML(NSString *body) {
         @"Content-Type: application/json\r\n"
         @"Content-Length: %lu\r\n"
         @"Mcp-Session-Id: %@\r\n"
+        @"MCP-Protocol-Version: %@\r\n"
         @"Connection: close\r\n"
         @"\r\n",
-        status, (unsigned long)jsonData.length, _sessionId];
+        status, (unsigned long)jsonData.length, _sessionId, [self negotiatedProtocolVersion]];
 
     NSMutableData *responseData = [NSMutableData dataWithData:[response dataUsingEncoding:NSUTF8StringEncoding]];
     [responseData appendData:jsonData];
@@ -1858,9 +1960,10 @@ static NSDictionary *MCPParseHTML(NSString *body) {
         @"HTTP/1.1 %d %@\r\n"
         @"Content-Type: application/json\r\n"
         @"Content-Length: %lu\r\n"
+        @"MCP-Protocol-Version: %@\r\n"
         @"Connection: close\r\n"
         @"\r\n",
-        status, statusText, (unsigned long)jsonData.length];
+        status, statusText, (unsigned long)jsonData.length, [self negotiatedProtocolVersion]];
 
     NSMutableData *responseData = [NSMutableData dataWithData:[header dataUsingEncoding:NSUTF8StringEncoding]];
     [responseData appendData:jsonData];
@@ -1877,9 +1980,10 @@ static NSDictionary *MCPParseHTML(NSString *body) {
         @"Content-Type: application/json\r\n"
         @"Content-Length: %lu\r\n"
         @"Allow: %@\r\n"
+        @"MCP-Protocol-Version: %@\r\n"
         @"Connection: close\r\n"
         @"\r\n",
-        (unsigned long)jsonData.length, allowedMethods ?: @"POST"];
+        (unsigned long)jsonData.length, allowedMethods ?: @"POST", [self negotiatedProtocolVersion]];
 
     NSMutableData *responseData = [NSMutableData dataWithData:[header dataUsingEncoding:NSUTF8StringEncoding]];
     [responseData appendData:jsonData];
@@ -1892,9 +1996,10 @@ static NSDictionary *MCPParseHTML(NSString *body) {
         @"HTTP/1.1 %d Accepted\r\n"
         @"Content-Length: 0\r\n"
         @"Mcp-Session-Id: %@\r\n"
+        @"MCP-Protocol-Version: %@\r\n"
         @"Connection: close\r\n"
         @"\r\n",
-        status, _sessionId];
+        status, _sessionId, [self negotiatedProtocolVersion]];
 
     NSData *data = [response dataUsingEncoding:NSUTF8StringEncoding];
     [self writeAll:socket data:data];
