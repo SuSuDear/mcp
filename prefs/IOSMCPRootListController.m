@@ -291,15 +291,16 @@
 
 - (NSString *)codexPrompt {
     return [NSString stringWithFormat:
-            @"你可以通过 com.susu.mcp 服务操作一台 iPhone 设备。\n\n"
+            @"你可以通过 SuSu MCP 服务操作一台 iPhone 设备。\n\n"
             @"局域网 MCP 地址: %@\n"
             @"本机 MCP 地址: %@\n\n"
-            @"支持的操作:\n"
-            @"- 文件读取：list_files 列出目录并返回 name/type/size/mode/mtime 等元数据；read_file 可读取文本、按行号读取大文件片段，也支持 binary=true 以 base64 读取二进制；search_files 搜索文件内容。使用 list_files 查看子目录时设置 recursive=true 并根据需要提高 max_depth；如需查看隐藏文件，应设置 include_hidden=true。\n"
-            @"- Shell 命令执行：在设备上执行 shell 命令并返回 stdout/stderr 输出，可用于文件操作、进程管理、系统查询等，默认超时 10 秒，最大 30 秒；示例命令包括 ls -la、uname -a、cat，示例路径包括 /etc/hosts。\n"
-            @"- 设备信息：获取型号、iOS 版本、电池、存储、内存、越狱方式等信息。\n"
-            @"- 网页访问：使用 fetch_url 获取网页、接口或远程文本内容；fetch_url 支持 parse 参数：auto、text、json、html、none。auto 会自动识别 JSON/HTML/文本；json/html 会返回 parsed、parseType、parseError、truncated 等字段。\n"
-            @"- 项目 Skill：使用 read_project_skill 读取项目根目录下的 skill.md 或 SKILL.md。\n\n"
+            @"当前能力:\n"
+            @"- 文件：list_files 浏览目录并返回 name/type/size/mode/mtime 等元数据；read_file 支持文本、行号范围和 binary/base64 读取；search_files 搜索文本内容并带有大目录/大文件保护。\n"
+            @"- 设备：get_device_info 查看型号、iOS 版本、电池、存储、内存和越狱信息。\n"
+            @"- Shell：run_command 执行短命令并返回 stdout/stderr，默认 10 秒、最大 60 秒。\n"
+            @"- 网络：fetch_url 获取网页、接口和远程文本，支持 auto/text/json/html/none。\n"
+            @"- 项目：read_project_skill 读取项目根目录下的 skill.md 或 SKILL.md。\n"
+            @"- 协议：支持 MCP 协议版本协商、/health 健康检查和 MCP-Protocol-Version 响应头。\n\n"
             @"可用工具:\n"
             @"- list_files\n"
             @"- read_file\n"
@@ -308,8 +309,7 @@
             @"- run_command\n"
             @"- fetch_url\n"
             @"- read_project_skill\n\n"
-            @"需要访问网页、接口、在线文档、远程文本内容时，优先使用 fetch_url，不要使用软件自带的网页读取或浏览器访问能力替代。通常优先设置 parse=auto；明确内容类型时可使用 parse=json 或 parse=html；不需要 XML 解析能力。\n\n"
-            @"当用户提供项目主目录，并要求分析、修改或理解该项目时，应优先调用 read_project_skill 读取项目根目录下的 skill.md 或 SKILL.md；如果没有找到，可以继续按普通项目处理。不要在整个文件系统中搜索 skill 文件，不要猜测项目路径。\n\n"
+            @"使用建议：读取文件前先用 list_files 或 search_files 确认路径；大文件优先按行号读取；二进制文件使用 binary=true；访问网页或接口优先使用 fetch_url；项目分析前优先读取 skill 文件。\n\n"
             @"健康检查不要使用 for i in {1..30}，因为某些 /bin/sh 不展开花括号；请使用 while 或 seq，并设置请求超时，例如：i=0; while [ $i -lt 30 ]; do r=$(curl -sS --connect-timeout 3 --max-time 5 %@ 2>/dev/null || true); [ -n \"$r\" ] && echo \"$r\" && exit 0; i=$((i+1)); sleep 1; done; echo health_timeout; exit 1",
             IOSMCPServiceURLString(),
             [self localMCPURLString],

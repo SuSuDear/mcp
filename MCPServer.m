@@ -22,7 +22,7 @@
 #define MCP_PROTOCOL_VERSION_LATEST @"2025-11-25"
 #define MCP_PROTOCOL_VERSION_LEGACY @"2025-03-26"
 #define MCP_SERVER_NAME             @"com.susu.mcp"
-#define MCP_SERVER_VERSION          @"1.1.2"
+#define MCP_SERVER_VERSION          @"1.1.3"
 #define HTTP_BUF_SIZE        (256 * 1024)
 #define MCP_MAX_CHUNK_LINE   (8 * 1024)
 #define MCP_LOG(fmt, ...)    NSLog(@"[susu][mcp] " fmt, ##__VA_ARGS__)
@@ -997,7 +997,7 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
                     @"httpHeader": @"MCP-Protocol-Version"
                 }
             },
-            @"instructions": @"Use com.susu.mcp to inspect files on the connected iPhone and run shell commands.\n\nFiles: list_files lists directory contents with metadata, read_file reads text or binary files and supports line ranges for text, and search_files searches file contents.\n\nDevice info: get_device_info for model, iOS version, battery, storage, memory, and jailbreak type/package information.\n\nShell: run_command executes shell commands on the device (timeout default 10s, max 60s).\n\nWeb: fetch_url fetches HTTP/HTTPS URL content.\n\nProject skills: read_project_skill reads skill.md or SKILL.md from a project root before project work.\n\nHealth checks: avoid shell brace expansion such as for i in {1..30}; use seq or a while loop, and set request timeouts for /health."
+            @"instructions": @"Use SuSu MCP to inspect and operate an iPhone through MCP.\n\nFiles: list_files browses directories with metadata; read_file reads text, line ranges, or binary/base64 content; search_files searches text files with safety limits.\n\nDevice: get_device_info returns model, iOS version, battery, storage, memory, and jailbreak information.\n\nShell: run_command executes short shell commands and returns stdout/stderr; default timeout is 10s and max timeout is 60s.\n\nWeb: fetch_url fetches HTTP/HTTPS content and can parse auto, text, json, html, or none.\n\nProject skills: read_project_skill loads skill.md or SKILL.md from a project root before project work.\n\nCompatibility: supports MCP protocol negotiation, /health reporting, supported protocol versions, and MCP-Protocol-Version headers.\n\nHealth checks: do not use shell brace expansion such as for i in {1..30}; use seq or a while loop, and set request timeouts for /health."
         }
     };
 }

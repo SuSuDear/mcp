@@ -1,9 +1,9 @@
 Package: com.susu.mcp
 Name: iOS MCP
 Depends: mobilesubstrate, preferenceloader
-Version: 1.1.1
+Version: 1.1.3
 Architecture: iphoneos-arm
-Description: MCP server for AI-driven iOS device control. Supports HID buttons, touch, screenshots, clipboard, app management, accessibility tree, and text input.
-Maintainer: witchan
-Author: witchan
+Description: Lightweight MCP server for iPhone inspection and automation. Provides file browsing, text/binary file reading, content search, device information, HTTP fetching, shell command execution, project skill loading, and MCP protocol compatibility helpers.
+Maintainer: SuSu
+Author: SuSu
 Section: Tweaks
