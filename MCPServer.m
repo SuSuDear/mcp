@@ -18,7 +18,6 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <dlfcn.h>
-#import <notify.h>
 
 #define MCP_PROTOCOL_VERSION_LATEST @"2025-11-25"
 #define MCP_PROTOCOL_VERSION_LEGACY @"2025-03-26"
@@ -27,28 +26,6 @@
 #define HTTP_BUF_SIZE        (256 * 1024)
 #define MCP_MAX_CHUNK_LINE   (8 * 1024)
 #define MCP_LOG(fmt, ...)    NSLog(@"[susu][mcp] " fmt, ##__VA_ARGS__)
-
-#define MCP_FLEX_RPC_ROOT @"/var/mobile/Library/Caches/com.susudear.flexing.rpc"
-#define MCP_FLEX_RPC_REQUEST_NOTIFICATION_PREFIX @"com.susudear.flexing.rpc.request/"
-#define MCP_FLEX_RPC_DEFAULT_TIMEOUT 3.0
-
-/// 构造 FLEX RPC 子目录路径，MCP 与目标 App Agent 通过该目录交换请求/响应 JSON。
-static NSString *MCPFlexRPCSubdir(NSString *name) {
-    return [MCP_FLEX_RPC_ROOT stringByAppendingPathComponent:name ?: @""];
-}
-
-/// 将 bundle id 转成安全文件名，避免斜杠等字符影响请求文件路径。
-static NSString *MCPFlexSafeFileComponent(NSString *value) {
-    NSMutableString *safe = [NSMutableString stringWithString:value ?: @""];
-    NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:@"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-_"];
-    for (NSUInteger i = 0; i < safe.length; i++) {
-        unichar c = [safe characterAtIndex:i];
-        if (![allowed characterIsMember:c]) {
-            [safe replaceCharactersInRange:NSMakeRange(i, 1) withString:@"_"];
-        }
-    }
-    return safe.length > 0 ? safe : @"unknown";
-}
 
 static BOOL MCPNumberFromArgs(NSDictionary *args, NSString *key, double defaultValue, BOOL required, double *outValue, NSString **outError) {
     id value = args[key];
@@ -556,11 +533,6 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
 - (NSDictionary *)executeRunCommand:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeFetchURL:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeReadProjectSkill:(id)reqId args:(NSDictionary *)args;
-- (NSDictionary *)executeFlexPing:(id)reqId args:(NSDictionary *)args;
-- (NSDictionary *)executeFlexRuntimeClasses:(id)reqId args:(NSDictionary *)args;
-- (NSDictionary *)executeFlexRuntimeMethods:(id)reqId args:(NSDictionary *)args;
-- (NSDictionary *)executeFlexRPC:(id)reqId action:(NSString *)action args:(NSDictionary *)args;
-- (NSString *)mcpFrontMostBundleIdentifier;
 - (NSDictionary *)mcpSuccess:(id)reqId text:(NSString *)text;
 - (NSDictionary *)mcpSuccess:(id)reqId text:(NSString *)text isError:(BOOL)isError;
 - (NSDictionary *)mcpError:(id)reqId code:(NSInteger)code message:(NSString *)message;
@@ -1115,46 +1087,6 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
             }
         },
         @{
-            @"name": @"flex_ping",
-            @"description": @"Ping the FLEX Runtime Agent injected into the frontmost or specified app. Used to verify RPC connectivity before runtime inspection.",
-            @"inputSchema": @{
-                @"type": @"object",
-                @"properties": @{
-                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle identifier. If omitted, the frontmost app is used."},
-                    @"timeout": @{@"type": @"number", @"description": @"Wait timeout in seconds (default: 3, max: 10)"}
-                }
-            }
-        },
-        @{
-            @"name": @"flex_runtime_classes",
-            @"description": @"List Objective-C runtime classes inside the target app process via the FLEX Runtime Agent.",
-            @"inputSchema": @{
-                @"type": @"object",
-                @"properties": @{
-                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle identifier. If omitted, the frontmost app is used."},
-                    @"prefix": @{@"type": @"string", @"description": @"Only return classes with this prefix"},
-                    @"contains": @{@"type": @"string", @"description": @"Only return classes containing this text"},
-                    @"limit": @{@"type": @"integer", @"description": @"Maximum classes to return (default: 200, max: 2000)"},
-                    @"timeout": @{@"type": @"number", @"description": @"Wait timeout in seconds (default: 3, max: 10)"}
-                }
-            }
-        },
-        @{
-            @"name": @"flex_runtime_methods",
-            @"description": @"List instance and class methods for a class inside the target app process via the FLEX Runtime Agent.",
-            @"inputSchema": @{
-                @"type": @"object",
-                @"properties": @{
-                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle identifier. If omitted, the frontmost app is used."},
-                    @"class": @{@"type": @"string", @"description": @"Objective-C class name"},
-                    @"include_instance": @{@"type": @"boolean", @"description": @"Include instance methods (default: true)"},
-                    @"include_class": @{@"type": @"boolean", @"description": @"Include class methods (default: true)"},
-                    @"timeout": @{@"type": @"number", @"description": @"Wait timeout in seconds (default: 3, max: 10)"}
-                },
-                @"required": @[@"class"]
-            }
-        },
-        @{
             @"name": @"read_project_skill",
             @"description": @"Read project-level skill instructions from skill.md or SKILL.md in a project root directory",
             @"inputSchema": @{
@@ -1213,12 +1145,6 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
         return [self executeFetchURL:reqId args:args];
     } else if ([toolName isEqualToString:@"read_project_skill"]) {
         return [self executeReadProjectSkill:reqId args:args];
-    } else if ([toolName isEqualToString:@"flex_ping"]) {
-        return [self executeFlexPing:reqId args:args];
-    } else if ([toolName isEqualToString:@"flex_runtime_classes"]) {
-        return [self executeFlexRuntimeClasses:reqId args:args];
-    } else if ([toolName isEqualToString:@"flex_runtime_methods"]) {
-        return [self executeFlexRuntimeMethods:reqId args:args];
     }
     return [self mcpError:reqId code:-32602 message:[NSString stringWithFormat:@"Unknown tool: %@", toolName]];
 }
@@ -1897,109 +1823,6 @@ static NSDictionary *MCPParseHTML(NSString *body) {
     NSData *jsonData = [NSJSONSerialization dataWithJSONObject:resultDict options:0 error:nil];
     NSString *jsonStr = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
     return [self mcpSuccess:reqId text:jsonStr isError:(httpResponse && httpResponse.statusCode >= 400)];
-}
-
-
-#pragma mark - FLEX Runtime Agent RPC Execution
-
-/// 获取 SpringBoard 当前前台 App 的 bundle identifier；未显式传 bundle_id 时使用它作为默认目标。
-- (NSString *)mcpFrontMostBundleIdentifier {
-    UIApplication *application = [UIApplication sharedApplication];
-    SEL frontSelector = NSSelectorFromString(@"_accessibilityFrontMostApplication");
-    if (![application respondsToSelector:frontSelector]) return nil;
-
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-    id frontMostApp = [application performSelector:frontSelector];
-#pragma clang diagnostic pop
-    if (!frontMostApp) return nil;
-
-    SEL bundleSelector = NSSelectorFromString(@"bundleIdentifier");
-    if (![frontMostApp respondsToSelector:bundleSelector]) return nil;
-
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-    id bundleIdentifier = [frontMostApp performSelector:bundleSelector];
-#pragma clang diagnostic pop
-    return [bundleIdentifier isKindOfClass:[NSString class]] ? bundleIdentifier : nil;
-}
-
-/// MCP 工具：验证目标 App 内的 FLEX Runtime Agent 是否在线。
-- (NSDictionary *)executeFlexPing:(id)reqId args:(NSDictionary *)args {
-    return [self executeFlexRPC:reqId action:@"ping" args:args];
-}
-
-/// MCP 工具：枚举目标 App 进程内已加载的 Objective-C 类。
-- (NSDictionary *)executeFlexRuntimeClasses:(id)reqId args:(NSDictionary *)args {
-    return [self executeFlexRPC:reqId action:@"classes" args:args];
-}
-
-/// MCP 工具：枚举目标 App 进程内指定类的方法列表。
-- (NSDictionary *)executeFlexRuntimeMethods:(id)reqId args:(NSDictionary *)args {
-    NSString *className = nil;
-    NSString *paramError = nil;
-    if (!MCPStringFromArgs(args, @"class", YES, &className, &paramError)) {
-        return [self mcpError:reqId code:-32602 message:paramError];
-    }
-    return [self executeFlexRPC:reqId action:@"methods" args:args];
-}
-
-/// 通过“请求文件 + Darwin notification + 响应文件”调用目标 App 内的 Agent。
-/// MCP 不跨进程直接读对象，只负责派发请求并等待目标进程序列化后的 JSON 结果。
-- (NSDictionary *)executeFlexRPC:(id)reqId action:(NSString *)action args:(NSDictionary *)args {
-    NSString *paramError = nil;
-    NSString *bundleIdentifier = nil;
-    if (!MCPStringFromArgs(args, @"bundle_id", NO, &bundleIdentifier, &paramError)) {
-        return [self mcpError:reqId code:-32602 message:paramError];
-    }
-    if (bundleIdentifier.length == 0) bundleIdentifier = [self mcpFrontMostBundleIdentifier];
-    if (bundleIdentifier.length == 0) {
-        return [self mcpSuccess:reqId text:MCPJSONString(@{@"error": @"no_target_bundle_id", @"message": @"Pass bundle_id or open a target app in foreground"}) isError:YES];
-    }
-
-    double timeout = MCP_FLEX_RPC_DEFAULT_TIMEOUT;
-    if (!MCPNumberFromArgs(args, @"timeout", MCP_FLEX_RPC_DEFAULT_TIMEOUT, NO, &timeout, &paramError)) {
-        return [self mcpError:reqId code:-32602 message:paramError];
-    }
-    if (timeout <= 0) timeout = MCP_FLEX_RPC_DEFAULT_TIMEOUT;
-    if (timeout > 10.0) timeout = 10.0;
-
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *requestsDir = MCPFlexRPCSubdir(@"requests");
-    NSString *responsesDir = MCPFlexRPCSubdir(@"responses");
-    [fm createDirectoryAtPath:requestsDir withIntermediateDirectories:YES attributes:@{NSFilePosixPermissions: @0777} error:nil];
-    [fm createDirectoryAtPath:responsesDir withIntermediateDirectories:YES attributes:@{NSFilePosixPermissions: @0777} error:nil];
-
-    NSString *requestId = [[NSUUID UUID] UUIDString];
-    NSMutableDictionary *arguments = [args mutableCopy] ?: [NSMutableDictionary dictionary];
-    [arguments removeObjectForKey:@"timeout"];
-    NSDictionary *request = @{@"id": requestId, @"bundle_id": bundleIdentifier, @"action": action ?: @"", @"arguments": arguments};
-    NSData *requestData = [NSJSONSerialization dataWithJSONObject:request options:0 error:nil];
-    if (!requestData) return [self mcpSuccess:reqId text:@"Failed to serialize FLEX RPC request" isError:YES];
-
-    NSString *requestPath = [requestsDir stringByAppendingPathComponent:[[MCPFlexSafeFileComponent(bundleIdentifier) stringByAppendingString:@".json"] copy]];
-    NSString *responsePath = [responsesDir stringByAppendingPathComponent:[requestId stringByAppendingPathExtension:@"json"]];
-    [fm removeItemAtPath:responsePath error:nil];
-    if (![requestData writeToFile:requestPath atomically:YES]) {
-        return [self mcpSuccess:reqId text:MCPJSONString(@{@"error": @"write_request_failed", @"path": requestPath}) isError:YES];
-    }
-
-    NSString *notification = [MCP_FLEX_RPC_REQUEST_NOTIFICATION_PREFIX stringByAppendingString:bundleIdentifier];
-    notify_post(notification.UTF8String);
-
-    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
-    while ([[NSDate date] compare:deadline] == NSOrderedAscending) {
-        NSData *responseData = [NSData dataWithContentsOfFile:responsePath];
-        if (responseData.length > 0) {
-            NSString *responseText = [[NSString alloc] initWithData:responseData encoding:NSUTF8StringEncoding] ?: @"{}";
-            id response = [NSJSONSerialization JSONObjectWithData:responseData options:0 error:nil];
-            BOOL isError = [response isKindOfClass:[NSDictionary class]] && [response[@"ok"] respondsToSelector:@selector(boolValue)] && ![response[@"ok"] boolValue];
-            return [self mcpSuccess:reqId text:responseText isError:isError];
-        }
-        [NSThread sleepForTimeInterval:0.05];
-    }
-
-    return [self mcpSuccess:reqId text:MCPJSONString(@{@"ok": @NO, @"error": @"flex_rpc_timeout", @"bundle_id": bundleIdentifier, @"request_id": requestId, @"message": @"Target app is not running, not injected, or agent did not respond before timeout"}) isError:YES];
 }
 
 #pragma mark - Project Skill Execution
