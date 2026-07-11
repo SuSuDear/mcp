@@ -3,7 +3,7 @@ Name: iOS MCP
 Depends: mobilesubstrate, preferenceloader
 Version: 1.1.3
 Architecture: iphoneos-arm
-Description: Lightweight MCP server for iPhone inspection and automation. Provides file browsing, text/binary file reading, content search, device information, HTTP fetching, shell command execution, project skill loading, and MCP protocol compatibility helpers.
+Description: Lightweight MCP server for iPhone inspection and automation. Provides file browsing, text/binary file reading, content search, device information, HTTP fetching, shell command execution, and MCP protocol compatibility helpers.
 Maintainer: SuSu
 Author: SuSu
 Section: Tweaks

@@ -532,7 +532,6 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
 - (NSDictionary *)executeGetDeviceInfo:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeRunCommand:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeFetchURL:(id)reqId args:(NSDictionary *)args;
-- (NSDictionary *)executeReadProjectSkill:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)mcpSuccess:(id)reqId text:(NSString *)text;
 - (NSDictionary *)mcpSuccess:(id)reqId text:(NSString *)text isError:(BOOL)isError;
 - (NSDictionary *)mcpError:(id)reqId code:(NSInteger)code message:(NSString *)message;
@@ -997,7 +996,7 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
                     @"httpHeader": @"MCP-Protocol-Version"
                 }
             },
-            @"instructions": @"Use SuSu MCP to inspect and operate an iPhone through MCP.\n\nFiles: list_files browses directories with metadata; read_file reads text, line ranges, or binary/base64 content; search_files searches text files with safety limits.\n\nDevice: get_device_info returns model, iOS version, battery, storage, memory, and jailbreak information.\n\nShell: run_command executes short shell commands and returns stdout/stderr; default timeout is 10s and max timeout is 60s.\n\nWeb: fetch_url fetches HTTP/HTTPS content and can parse auto, text, json, html, or none.\n\nProject skills: read_project_skill loads skill.md or SKILL.md from a project root before project work.\n\nCompatibility: supports MCP protocol negotiation, /health reporting, supported protocol versions, and MCP-Protocol-Version headers.\n\nHealth checks: do not use shell brace expansion such as for i in {1..30}; use seq or a while loop, and set request timeouts for /health."
+            @"instructions": @"Use SuSu MCP to inspect and operate an iPhone through MCP.\n\nFiles: list_files browses directories with metadata; read_file reads text, line ranges, or binary/base64 content; search_files searches text files with safety limits.\n\nDevice: get_device_info returns model, iOS version, battery, storage, memory, and jailbreak information.\n\nShell: run_command executes short shell commands and returns stdout/stderr; default timeout is 10s and max timeout is 60s.\n\nWeb: fetch_url fetches HTTP/HTTPS content and can parse auto, text, json, html, or none.\n\nCompatibility: supports MCP protocol negotiation, /health reporting, supported protocol versions, and MCP-Protocol-Version headers.\n\nHealth checks: do not use shell brace expansion such as for i in {1..30}; use seq or a while loop, and set request timeouts for /health."
         }
     };
 }
@@ -1085,18 +1084,6 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
                 },
                 @"required": @[@"url"]
             }
-        },
-        @{
-            @"name": @"read_project_skill",
-            @"description": @"Read project-level skill instructions from skill.md or SKILL.md in a project root directory",
-            @"inputSchema": @{
-                @"type": @"object",
-                @"properties": @{
-                    @"path": @{@"type": @"string", @"description": @"Absolute path to the project root directory"},
-                    @"max_bytes": @{@"type": @"integer", @"description": @"Maximum bytes to read (default: 200000, max: 1048576)"}
-                },
-                @"required": @[@"path"]
-            }
         }
     ];
 
@@ -1143,8 +1130,6 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
         return [self executeRunCommand:reqId args:args];
     } else if ([toolName isEqualToString:@"fetch_url"]) {
         return [self executeFetchURL:reqId args:args];
-    } else if ([toolName isEqualToString:@"read_project_skill"]) {
-        return [self executeReadProjectSkill:reqId args:args];
     }
     return [self mcpError:reqId code:-32602 message:[NSString stringWithFormat:@"Unknown tool: %@", toolName]];
 }
@@ -1823,70 +1808,6 @@ static NSDictionary *MCPParseHTML(NSString *body) {
     NSData *jsonData = [NSJSONSerialization dataWithJSONObject:resultDict options:0 error:nil];
     NSString *jsonStr = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
     return [self mcpSuccess:reqId text:jsonStr isError:(httpResponse && httpResponse.statusCode >= 400)];
-}
-
-#pragma mark - Project Skill Execution
-
-- (NSDictionary *)executeReadProjectSkill:(id)reqId args:(NSDictionary *)args {
-    NSString *paramError = nil;
-    NSString *path = nil;
-    if (!MCPStringFromArgs(args, @"path", YES, &path, &paramError)) {
-        return [self mcpError:reqId code:-32602 message:paramError];
-    }
-
-    NSInteger maxBytes = MCPIntegerFromArgs(args, @"max_bytes", 200000);
-    if (maxBytes <= 0) maxBytes = 200000;
-    if (maxBytes > 1024 * 1024) maxBytes = 1024 * 1024;
-
-    NSString *root = MCPResolvedToolPath(path);
-    NSFileManager *fm = [NSFileManager defaultManager];
-    BOOL isDir = NO;
-    if (![fm fileExistsAtPath:root isDirectory:&isDir] || !isDir) {
-        return [self mcpSuccess:reqId text:[NSString stringWithFormat:@"Project root is not a directory: %@", root] isError:YES];
-    }
-
-    NSString *skillPath = [root stringByAppendingPathComponent:@"skill.md"];
-    if (![fm fileExistsAtPath:skillPath]) {
-        skillPath = [root stringByAppendingPathComponent:@"SKILL.md"];
-    }
-
-    BOOL isSkillDir = NO;
-    if (![fm fileExistsAtPath:skillPath isDirectory:&isSkillDir] || isSkillDir) {
-        NSDictionary *resultDict = @{
-            @"projectRoot": root,
-            @"found": @NO,
-            @"message": @"No skill.md or SKILL.md found in project root."
-        };
-        NSData *jsonData = [NSJSONSerialization dataWithJSONObject:resultDict options:0 error:nil];
-        NSString *jsonStr = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
-        return [self mcpSuccess:reqId text:jsonStr];
-    }
-
-    NSData *data = [NSData dataWithContentsOfFile:skillPath];
-    if (!data) {
-        return [self mcpSuccess:reqId text:[NSString stringWithFormat:@"Failed to read skill file: %@", skillPath] isError:YES];
-    }
-
-    BOOL truncated = NO;
-    if (data.length > (NSUInteger)maxBytes) {
-        data = [data subdataWithRange:NSMakeRange(0, (NSUInteger)maxBytes)];
-        truncated = YES;
-    }
-    NSString *content = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-    if (!content) {
-        return [self mcpSuccess:reqId text:[NSString stringWithFormat:@"Skill file is not valid UTF-8 text: %@", skillPath] isError:YES];
-    }
-
-    NSDictionary *resultDict = @{
-        @"projectRoot": root,
-        @"skillPath": skillPath,
-        @"found": @YES,
-        @"content": content,
-        @"truncated": @(truncated)
-    };
-    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:resultDict options:0 error:nil];
-    NSString *jsonStr = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
-    return [self mcpSuccess:reqId text:jsonStr];
 }
 
 #pragma mark - Response Builders

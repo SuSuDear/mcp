@@ -299,7 +299,6 @@
             @"- 设备：get_device_info 查看型号、iOS 版本、电池、存储、内存和越狱信息。\n"
             @"- Shell：run_command 执行短命令并返回 stdout/stderr，默认 10 秒、最大 60 秒。\n"
             @"- 网络：fetch_url 获取网页、接口和远程文本，支持 auto/text/json/html/none。\n"
-            @"- 项目：read_project_skill 读取项目根目录下的 skill.md 或 SKILL.md。\n"
             @"- 协议：支持 MCP 协议版本协商、/health 健康检查和 MCP-Protocol-Version 响应头。\n\n"
             @"可用工具:\n"
             @"- list_files\n"
@@ -308,8 +307,7 @@
             @"- get_device_info\n"
             @"- run_command\n"
             @"- fetch_url\n"
-            @"- read_project_skill\n\n"
-            @"使用建议：读取文件前先用 list_files 或 search_files 确认路径；大文件优先按行号读取；二进制文件使用 binary=true；访问网页或接口优先使用 fetch_url；项目分析前优先读取 skill 文件。\n\n"
+            @"使用建议：读取文件前先用 list_files 或 search_files 确认路径；大文件优先按行号读取；二进制文件使用 binary=true；访问网页或接口优先使用 fetch_url。\n\n"
             @"健康检查不要使用 for i in {1..30}，因为某些 /bin/sh 不展开花括号；请使用 while 或 seq，并设置请求超时，例如：i=0; while [ $i -lt 30 ]; do r=$(curl -sS --connect-timeout 3 --max-time 5 %@ 2>/dev/null || true); [ -n \"$r\" ] && echo \"$r\" && exit 0; i=$((i+1)); sleep 1; done; echo health_timeout; exit 1",
             IOSMCPServiceURLString(),
             [self localMCPURLString],
