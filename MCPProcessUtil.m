@@ -2,6 +2,7 @@
 #include <roothide.h>
 #import <dispatch/dispatch.h>
 #import <errno.h>
+#import <fcntl.h>
 #import <signal.h>
 #import <spawn.h>
 #import <string.h>
@@ -35,6 +36,17 @@ static void MCPFreeCStringArray(char **array, NSUInteger count) {
         free(array[i]);
     }
     free(array);
+}
+
+static void MCPInitSpawnAttributes(posix_spawnattr_t *attr) {
+    posix_spawnattr_init(attr);
+#ifdef POSIX_SPAWN_CLOEXEC_DEFAULT
+    short flags = 0;
+    if (posix_spawnattr_getflags(attr, &flags) == 0) {
+        flags |= POSIX_SPAWN_CLOEXEC_DEFAULT;
+        posix_spawnattr_setflags(attr, flags);
+    }
+#endif
 }
 
 NSString *MCPResolvedJailbreakPath(NSString *path) {
@@ -116,6 +128,7 @@ BOOL MCPRunProcess(NSString *launchPath,
 
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
     posix_spawn_file_actions_adddup2(&actions, pipeFDs[1], STDOUT_FILENO);
     posix_spawn_file_actions_adddup2(&actions, pipeFDs[1], STDERR_FILENO);
     posix_spawn_file_actions_addclose(&actions, pipeFDs[0]);
@@ -160,7 +173,10 @@ BOOL MCPRunProcess(NSString *launchPath,
     }
 
     pid_t pid = 0;
-    int spawnStatus = posix_spawn(&pid, launchPath.fileSystemRepresentation, &actions, NULL, argv, envp);
+    posix_spawnattr_t attr;
+    MCPInitSpawnAttributes(&attr);
+    int spawnStatus = posix_spawn(&pid, launchPath.fileSystemRepresentation, &actions, &attr, argv, envp);
+    posix_spawnattr_destroy(&attr);
 
     MCPFreeCStringArray(argv, argvStrings.count);
     if (environmentOverrides.count > 0) {

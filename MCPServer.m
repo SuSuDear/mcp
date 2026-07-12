@@ -27,6 +27,14 @@
 #define MCP_MAX_CHUNK_LINE   (8 * 1024)
 #define MCP_LOG(fmt, ...)    NSLog(@"[susu][mcp] " fmt, ##__VA_ARGS__)
 
+static void MCPSetCloseOnExec(int fd) {
+    if (fd < 0) return;
+    int flags = fcntl(fd, F_GETFD, 0);
+    if (flags >= 0) {
+        fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+    }
+}
+
 static BOOL MCPNumberFromArgs(NSDictionary *args, NSString *key, double defaultValue, BOOL required, double *outValue, NSString **outError) {
     id value = args[key];
     if (!value || value == [NSNull null]) {
@@ -597,6 +605,7 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
         MCP_LOG(@"Failed to create socket: %s", strerror(errno));
         return;
     }
+    MCPSetCloseOnExec(sock);
 
     int reuse = 1;
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
@@ -632,6 +641,7 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
         if (!self) return;
         int client = accept(sock, NULL, NULL);
         if (client >= 0) {
+            MCPSetCloseOnExec(client);
             dispatch_async(self->_clientQueue, ^{
                 [self handleClient:client];
             });
@@ -797,7 +807,14 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
     } else if ([basePath isEqualToString:@"/mcp"]) {
         [self sendMethodNotAllowedResponse:clientSocket allowedMethods:@"POST" message:@"Method Not Allowed"];
     } else if ([method isEqualToString:@"GET"] && [basePath isEqualToString:@"/health"]) {
-        NSDictionary *health = @{@"status": @"ok", @"server": MCP_SERVER_NAME, @"version": MCP_SERVER_VERSION, @"protocolVersion": [self negotiatedProtocolVersion], @"supportedProtocolVersions": MCPSupportedProtocolVersions()};
+        NSDictionary *health = @{
+            @"status": @"ok",
+            @"server": MCP_SERVER_NAME,
+            @"version": MCP_SERVER_VERSION,
+            @"port": @(_port),
+            @"protocolVersion": [self negotiatedProtocolVersion],
+            @"supportedProtocolVersions": MCPSupportedProtocolVersions()
+        };
         [self sendJSONResponse:clientSocket status:200 body:health];
     } else {
         [self sendErrorResponse:clientSocket status:404 message:@"Not Found"];
