@@ -1013,7 +1013,7 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
                     @"httpHeader": @"MCP-Protocol-Version"
                 }
             },
-            @"instructions": @"Use SuSu MCP to inspect and operate an iPhone through MCP.\n\nFiles: list_files browses directories with metadata; read_file reads text, line ranges, or binary/base64 content; search_files searches text files with safety limits.\n\nDevice: get_device_info returns model, iOS version, battery, storage, memory, and jailbreak information.\n\nShell: run_command executes short shell commands and returns stdout/stderr; default timeout is 10s and max timeout is 60s.\n\nWeb: fetch_url fetches HTTP/HTTPS content and can parse auto, text, json, html, or none.\n\nCompatibility: supports MCP protocol negotiation, /health reporting, supported protocol versions, and MCP-Protocol-Version headers.\n\nHealth checks: do not use shell brace expansion such as for i in {1..30}; use seq or a while loop, and set request timeouts for /health."
+            @"instructions": @"Use SuSu MCP to inspect and operate an iPhone through MCP.\n\nFiles: list_files browses directories with metadata; read_file reads text, line ranges, or binary/base64 content; search_files searches text files with safety limits.\n\nDevice: get_device_info returns model, iOS version, battery, storage, memory, and jailbreak information.\n\nShell: run_command executes short shell commands and returns stdout/stderr; default timeout is 10s and max timeout is 300s.\n\nWeb: fetch_url fetches HTTP/HTTPS content and can parse auto, text, json, html, or none.\n\nCompatibility: supports MCP protocol negotiation, /health reporting, supported protocol versions, and MCP-Protocol-Version headers.\n\nHealth checks: do not use shell brace expansion such as for i in {1..30}; use seq or a while loop, and set request timeouts for /health."
         }
     };
 }
@@ -1083,7 +1083,7 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
                 @"type": @"object",
                 @"properties": @{
                     @"command": @{@"type": @"string", @"description": @"Shell command to execute (e.g. ls -la, uname -a, cat). Example path: /etc/hosts"},
-                    @"timeout": @{@"type": @"number", @"description": @"Timeout in seconds (default: 10, max: 60)"}
+                    @"timeout": @{@"type": @"number", @"description": @"Timeout in seconds (default: 10, max: 300)"}
                 },
                 @"required": @[@"command"]
             }
@@ -1095,7 +1095,7 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
                 @"type": @"object",
                 @"properties": @{
                     @"url": @{@"type": @"string", @"description": @"HTTP or HTTPS URL to fetch"},
-                    @"timeout": @{@"type": @"number", @"description": @"Timeout in seconds (default: 15, max: 60)"},
+                    @"timeout": @{@"type": @"number", @"description": @"Timeout in seconds (default: 15, max: 300)"},
                     @"max_bytes": @{@"type": @"integer", @"description": @"Maximum response bytes to return (default: 200000, max: 1048576)"},
                     @"parse": @{@"type": @"string", @"description": @"Response parsing mode: auto, text, json, html, or none (default: auto)"}
                 },
@@ -1626,7 +1626,7 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
         return [self mcpError:reqId code:-32602 message:paramError];
     }
     if (timeoutSec <= 0) timeoutSec = 10;
-    if (timeoutSec > 60) timeoutSec = 60;
+    if (timeoutSec > 300) timeoutSec = 300;
 
     NSString *shellPath = MCPResolvedJailbreakPath(@"/bin/sh");
     NSString *output = nil;
@@ -1747,7 +1747,7 @@ static NSDictionary *MCPParseHTML(NSString *body) {
     double timeoutSec = 15;
     if (!MCPNumberFromArgs(args, @"timeout", 15, NO, &timeoutSec, &paramError)) return [self mcpError:reqId code:-32602 message:paramError];
     if (timeoutSec <= 0) timeoutSec = 15;
-    if (timeoutSec > 60) timeoutSec = 60;
+    if (timeoutSec > 300) timeoutSec = 300;
 
     NSInteger maxBytes = MCPIntegerFromArgs(args, @"max_bytes", 200000);
     if (maxBytes <= 0) maxBytes = 200000;
